@@ -1,0 +1,16 @@
+[Unit]
+Description=vermont exports netflow v9 and ipfix flows
+
+[Service]
+User=vermont
+Group=nogroup
+RuntimeDirectory=vermont
+RuntimeDirectoryMode=777
+Restart=on-failure
+ExecReload=/bin/kill -HUP $MAINPID
+Environment=VERMONT_LOGGING_LEVEL=notice
+ExecStart=/usr/sbin/vermont -j -q -l ${VERMONT_LOGGING_LEVEL} -f /etc/vermont/vermont.xml
+AmbientCapabilities=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

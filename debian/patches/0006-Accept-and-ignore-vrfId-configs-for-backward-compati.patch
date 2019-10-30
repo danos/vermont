@@ -1,0 +1,26 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Thu, 14 Dec 2017 10:04:40 +0000
+Subject: Accept-and-ignore-vrfId-configs-for-backward-compati
+
+---
+ src/modules/ipfix/CollectorCfg.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/modules/ipfix/CollectorCfg.h b/src/modules/ipfix/CollectorCfg.h
+index e530453..2ca5d75 100644
+--- a/src/modules/ipfix/CollectorCfg.h
++++ b/src/modules/ipfix/CollectorCfg.h
+@@ -71,6 +71,13 @@ public:
+ #else
+ 				THROWEXCEPTION("Invalid configuration parameter: vrfName."
+ 						" Build with -DENABLE_VRF=ON to enable.");
++#endif
++			} else if (e->matches("vrfId")) {
++#if defined(ENABLE_ROUTING_DOMAIN)
++				// Accept vrfId for backward compatibility but ignore it
++#else
++				THROWEXCEPTION("Invalid configuration parameter: vrfId."
++						" Build with -DENABLE_ROUTING_DOMAIN=ON to enable.");
+ #endif
+ 			} else if (e->matches("authorizedHost")) {
+ 				authorizedHosts.push_back(e->getContent());

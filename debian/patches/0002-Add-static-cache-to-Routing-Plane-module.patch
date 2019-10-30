@@ -1,0 +1,752 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Tue, 4 Aug 2015 16:09:07 +0100
+Subject: Add static cache to Routing Plane module
+
+---
+ src/common/ipfixlolib/encoding.c   |  32 ++++
+ src/common/ipfixlolib/encoding.h   |  19 +++
+ src/modules/ipfix/RoutingPlane.cpp | 329 +++++++++++++++++++++++++++++++++----
+ src/modules/ipfix/RoutingPlane.hpp | 141 +++++++++++++++-
+ 4 files changed, 486 insertions(+), 35 deletions(-)
+
+diff --git a/src/common/ipfixlolib/encoding.c b/src/common/ipfixlolib/encoding.c
+index 2a8cad7..70fe577 100644
+--- a/src/common/ipfixlolib/encoding.c
++++ b/src/common/ipfixlolib/encoding.c
+@@ -19,6 +19,38 @@
+ extern "C" {
+ #endif
+ 
++
++#if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++unsigned __int128
++be128toh (unsigned __int128 big_endian_128bits) {
++		union _128_as_64 {
++		    unsigned __int128 v;
++		    uint64_t q[2];
++		} u1, u2;
++		u1.v = big_endian_128bits;
++		u2.q[1] = be64toh(u1.q[0]);
++		u2.q[0] = be64toh(u1.q[1]);
++
++		return u2.v;
++}
++
++unsigned __int128
++h128tobe(unsigned __int128 host_128bits) {
++		union _128_as_64 {
++		    unsigned __int128 v;
++		    uint64_t q[2];
++		} u1, u2;
++		u1.v = host_128bits;
++		u2.q[1] = htobe64(u1.q[0]);
++		u2.q[0] = htobe64(u1.q[1]);
++
++		return u2.v;
++}
++#pragma GCC diagnostic pop
++#endif
++
+ /*
+  * I took the 64-bit functions from
+  * http://komssys.sourceforge.net/html/MNRTPNetTypes_8h-source.html
+diff --git a/src/common/ipfixlolib/encoding.h b/src/common/ipfixlolib/encoding.h
+index 05ea176..f9c7aa6 100644
+--- a/src/common/ipfixlolib/encoding.h
++++ b/src/common/ipfixlolib/encoding.h
+@@ -28,6 +28,25 @@ extern "C" {
+ #define VENDOR_SPECIFIC 1
+ #define NOT_VENDOR_SPECIFIC 2
+ 
++#if defined(__linux__)
++#  include <endian.h>
++#elif defined(__FreeBSD__) || defined(__NetBSD__)
++#  include <sys/endian.h>
++#elif defined(__OpenBSD__)
++#  include <sys/types.h>
++#  define be64toh(x) betoh64(x)
++#  define h64tobe(x) htobe64(x)
++#endif
++
++
++#if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++unsigned __int128 be128toh(unsigned __int128 big_endian_128bits);
++unsigned __int128 h128tobe(unsigned __int128 host_128bits);
++#pragma GCC diagnostic pop
++#endif
++
+ /*
+  I took the 64-bit functions from
+  http://komssys.sourceforge.net/html/MNRTPNetTypes_8h-source.html
+diff --git a/src/modules/ipfix/RoutingPlane.cpp b/src/modules/ipfix/RoutingPlane.cpp
+index d7d8089..fd1b94d 100644
+--- a/src/modules/ipfix/RoutingPlane.cpp
++++ b/src/modules/ipfix/RoutingPlane.cpp
+@@ -22,6 +22,7 @@
+ 
+ #include <czmq.h>
+ #include <boost/config.hpp>
++#include <cstdint>
+ 
+ #include "RoutingPlane.hpp"
+ #include "common/msg.h"
+@@ -49,6 +50,15 @@ const char* routing_plane_errors[] = {
+ 		"ROUTING_PLANE_ERROR_INVALID_FLAGS"
+ };
+ 
++/*
++ * The caches and the lock are static, so that they get shared between all the
++ * RoutinPlane modules, in order to absolutely minimize sending requests.
++ */
++std::unordered_map<std::pair<routing_plane_data_t *, uint16_t>,
++	routing_plane_data_t *, IpHasher, IpMatcher> RoutingPlane::cache_ip;
++std::unordered_map<routing_plane_data_t *, routing_plane_data_t *,
++	SubnetHasher, SubnetMatcher> RoutingPlane::cache_subnet;
++Mutex RoutingPlane::cache_lock;
+ 
+ void
+ RoutingPlane::setUpHelper ()
+@@ -153,12 +163,93 @@ RoutingPlane::reconfigure(std::string zmq_dealer_endpoint,
+ 	}
+ }
+ 
++static int
++routing_plane_data_t_deep_copy (routing_plane_data_t *output,
++		routing_plane_data_t *input, bool copy_ip_addresses)
++{
++	RoutingPlane::routing_plane_cleanup_data_t(output, copy_ip_addresses);
++
++	output->host_asn = input->host_asn;
++	output->adj_asn = input->adj_asn;
++	output->pbr_table_id = input->pbr_table_id;
++	output->vrf_id = input->vrf_id;
++	output->prefix_length = input->prefix_length;
++
++	if (copy_ip_addresses && input->ip_count) {
++		output->family = input->family;
++		output->ip_count = input->ip_count;
++		output->ip_addresses = (ip46 *)malloc(sizeof(ip46) *
++				input->ip_count);
++		if (!output->ip_addresses) {
++			return -1;
++		}
++		memcpy(output->ip_addresses, input->ip_addresses, sizeof(ip46) *
++				input->ip_count);
++	}
++
++	if (copy_ip_addresses) {
++		memcpy(&output->ip_subnet, &input->ip_subnet, sizeof(ip46));
++	}
++
++	if (input->vrf_name_length) {
++		output->vrf_name_length = input->vrf_name_length;
++		output->vrf_name = (char *)malloc(input->vrf_name_length);
++		if (!output->vrf_name) {
++			if (copy_ip_addresses) {
++				free(output->ip_addresses);
++			}
++			return -1;
++		}
++		memcpy(output->vrf_name, input->vrf_name, input->vrf_name_length);
++	}
++
++	if (input->ip_next_hop_count) {
++		output->ip_next_hop_count = input->ip_next_hop_count;
++		output->ip_next_hops = (ip46 *)malloc(sizeof(ip46) *
++				input->ip_next_hop_count);
++		if (!output->ip_next_hops) {
++			if (copy_ip_addresses) {
++				free(output->ip_addresses);
++			}
++			free(output->vrf_name);
++			return -1;
++		}
++		memcpy(output->ip_next_hops, input->ip_next_hops, sizeof(ip46) *
++				input->ip_next_hop_count);
++	}
++
++	if (input->bgp_next_hop_count) {
++		output->bgp_next_hop_count = input->bgp_next_hop_count;
++		output->bgp_next_hops = (ip46 *)malloc(sizeof(ip46) *
++				input->bgp_next_hop_count);
++		if (!output->bgp_next_hops) {
++			if (copy_ip_addresses) {
++				free(output->ip_addresses);
++			}
++			free(output->vrf_name);
++			free(output->ip_next_hops);
++			return -1;
++		}
++		memcpy(output->bgp_next_hops, input->bgp_next_hops, sizeof(ip46) *
++				input->bgp_next_hop_count);
++	}
++
++	return 0;
++}
++
+ void
+-RoutingPlane::routing_plane_cleanup_data_t (routing_plane_data_t *routing_data)
++RoutingPlane::routing_plane_cleanup_data_t (routing_plane_data_t *routing_data,
++		bool clean_ip_addresses)
+ {
+ 	if (routing_data) {
+ 		msg(LOG_INFO, "Routing Plane API: freeing routing_data buffers");
+ 
++		if (clean_ip_addresses && routing_data->ip_count) {
++			free(routing_data->ip_addresses);
++			routing_data->ip_addresses = NULL;
++			routing_data->ip_count = 0;
++		}
++
+ 		if (routing_data->vrf_name_length) {
+ 			free(routing_data->vrf_name);
+ 			routing_data->vrf_name = NULL;
+@@ -179,6 +270,51 @@ RoutingPlane::routing_plane_cleanup_data_t (routing_plane_data_t *routing_data)
+ 	}
+ }
+ 
++static inline void
++set_subnet_from_ip_prefix (routing_plane_data_t *routing_data)
++{
++	char debug_buffer[40];
++
++	if (routing_data->ip_count == 0) {
++		return;
++	}
++	/*
++	 * Derive subnet value from IP and Prefix Length
++	 */
++	if (routing_data->family == AF_INET) {
++		routing_data->ip_subnet.addr.s_addr = htonl((UINT32_MAX <<
++			(32 - routing_data->prefix_length)) &
++			ntohl(routing_data->ip_addresses[0].addr.s_addr));
++	} else if (routing_data->family == AF_INET6) {
++		/*
++		 * For IPv6, not so easy to do it efficiently and sanely.
++		 * GCC/Clang come in our help, but we really should avoid
++		 * hard dependency on the compiler, so we have a fall back.
++		 */
++#if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++		/*
++		 * Compilers define 128 bit type, but do not support 128 constants.
++		 * Ridiculous! We have to use memset instead of shifting UINT_MAX128.
++		 */
++		memset(&routing_data->ip_subnet, UINT8_MAX, sizeof(unsigned __int128));
++		routing_data->ip_subnet.v128 = h128tobe(
++				(routing_data->ip_subnet.v128 <<
++						(128 - routing_data->prefix_length)) &
++				be128toh(routing_data->ip_addresses[0].v128));
++#pragma GCC diagnostic pop
++#else
++		memset(&routing_data->ip_subnet, 0, sizeof(ip46));
++#endif
++	}
++
++	inet_ntop(routing_data->family, &routing_data->ip_subnet, debug_buffer,
++			40);
++	msg(LOG_INFO, "Routing Plane API: parsing response: subnet %s",
++			debug_buffer);
++}
++
+ static inline bool
+ parse_ip_address (bool *parsed_ip, uint16_t ip_length,
+ 		routing_plane_data_t *routing_data, uint8_t *data)
+@@ -194,15 +330,38 @@ parse_ip_address (bool *parsed_ip, uint16_t ip_length,
+ 		return false;
+ 	}
+ 
+-	memcpy(&routing_data->ip_address, data, ip_length);
++	/*
++	 * Message is an update about subnet, so record the IP
++	 */
++	if (routing_data->ip_count == 0) {
++		routing_data->ip_count = 1;
++		routing_data->ip_addresses = (ip46 *)malloc(sizeof(ip46));
++		if (!routing_data->ip_addresses) {
++			return false;
++		}
++		memcpy(&routing_data->ip_addresses[0], data, ip_length);
++
++		*parsed_ip = true;
+ 
+-	*parsed_ip = true;
++		return true;
++	}
+ 
+-	inet_ntop(routing_data->family, &routing_data->ip_address, debug_buffer,
+-			40);
+-	msg(LOG_INFO, "Routing Plane API: parsing response: IP %s", debug_buffer);
++	for (uint16_t i = 0; i < routing_data->ip_count; ++i) {
++		if (!memcmp(&routing_data->ip_addresses[i], data, ip_length)) {
++			inet_ntop(routing_data->family, &routing_data->ip_addresses[i],
++					debug_buffer, 40);
++			msg(LOG_INFO, "Routing Plane API: parsing response: IP %s",
++					debug_buffer);
++			*parsed_ip = true;
++			return true;
++		}
++	}
+ 
+-	return true;
++	inet_ntop(routing_data->family, data, debug_buffer,
++			40);
++	msg(LOG_ERR, "Routing Plane API: parsed IP does not match: %s",
++			debug_buffer);
++	return false;
+ }
+ 
+ static inline bool
+@@ -438,7 +597,7 @@ parse_data (routing_plane_data_t *routing_data, uint8_t *data,
+ 	return ret;
+ 
+ error:
+-RoutingPlane::routing_plane_cleanup_data_t(routing_data);
++RoutingPlane::routing_plane_cleanup_data_t(routing_data, false);
+ 	memset(routing_data, 0, sizeof(routing_plane_data_t));
+ 
+ 	return ret;
+@@ -551,6 +710,8 @@ parse_frame (routing_plane_data_t *routing_data, uint8_t *reply,
+ 		}
+ 	}
+ 
++	set_subnet_from_ip_prefix(routing_data);
++
+ 	return ret;
+ }
+ 
+@@ -643,11 +804,11 @@ create_request (uint16_t request_type, routing_plane_data_t *routing_data,
+ 	NF_MSG_SET_DATA_LENGTH(buffer + offset, ip_length);
+ 
+ 	offset += NF_DATA_HEADER_LENGTH;
+-	memcpy(buffer + offset, &routing_data->ip_address, ip_length);
++	memcpy(buffer + offset, &routing_data->ip_addresses[0], ip_length);
+ 	offset += ip_length;
+ 
+-	inet_ntop(routing_data->family, &routing_data->ip_address, debug_buffer,
+-			40);
++	inet_ntop(routing_data->family, &routing_data->ip_addresses[0],
++			debug_buffer, 40);
+ 	msg(LOG_INFO, "Routing Plane API: parsing request: IP %s", debug_buffer);
+ 
+ 
+@@ -697,6 +858,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 	zframe_t *frame_reply;
+ 	size_t i, num_frames, good_frames = 0, request_size = 0;
+ 	int ret = 0;
++	std::list<size_t>indexes;
+ 
+ 	errno = 0;
+ 
+@@ -743,10 +905,26 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 	/*
+ 	 * Parse the input and create a frame for each routing_plane_data_t
+ 	 * structure (a frame per address), as per protocol definition.
++	 * Since some items might be cached, we save the indexes of those we have
++	 * to change in a list.
+ 	 */
+ 	for (i = 0; i < req_count; ++i) {
+ 		msg(LOG_INFO, "Routing Plane API: processing request %zu", i);
+ 
++		cache_lock.lock();
++		if (cache_ip.count(pair<routing_plane_data_t *,
++				uint16_t>(routing_data[i], 0))) {
++			routing_plane_data_t_deep_copy(routing_data[i],
++					(routing_plane_data_t *)cache_ip[pair<routing_plane_data_t *,
++													 uint16_t>(routing_data[i],
++															 0)], false);
++			cache_lock.unlock();
++			continue;
++		}
++		cache_lock.unlock();
++
++		indexes.push_back(i);
++
+ 		ret = create_request(flags, routing_data[i], request_buffer,
+ 				&request_size);
+ 		if (BOOST_UNLIKELY(ret < 0)) {
+@@ -760,8 +938,14 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 		}
+ 	}
+ 
++	if (indexes.size() == 0) {
++		msg(LOG_INFO, "Routing Plane API: 100%% cache hit, no message sent");
++		ret = 0;
++		goto error;
++	}
++
+ 	msg(LOG_INFO, "Routing Plane API: sending %zu frames in one message to "
+-			"Routing Plane", req_count);
++			"Routing Plane", indexes.size());
+ 
+ 	ret = zmsg_send(&msg_request, zmq_dealer_socket);
+ 	if (ret < 0) {
+@@ -807,20 +991,6 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 	msg(LOG_INFO, "Routing Plane API: resetting input routing_data before "
+ 			"parsing response");
+ 
+-	/*
+-	 * If we got to this point, we got a reply back and it has at least some
+-	 * frames, which means some data. So from now on, we _COULD_ return with a
+-	 * partial answer, since we are doing a best-effort service. Zero the input
+-	 * in order to avoid mismatches of the kind: 2 requests but only one reply
+-	 * to the second req, which if we don't zero the struct will mean returning
+-	 * the same IP address in both members, one with the actual data and one
+-	 * with the expected info zeroe'd.
+-	 */
+-	for (i = 0; i < req_count; ++i) {
+-		routing_plane_cleanup_data_t(routing_data[i]);
+-		memset(routing_data[i], 0, sizeof(routing_plane_data_t));
+-	}
+-
+ 	/*
+ 	 * Pop the first empty frame. We are using ZMQ_DEALER, which unlike ZMQ_REQ
+ 	 * does not remove it for us.
+@@ -834,7 +1004,9 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 	 * returning to the caller. As per protocol definition, we expect one frame
+ 	 * per address request.
+ 	 */
+-	for (i = 0; i < num_frames && i < req_count; ++i) {
++	i = 0; // refuses to compile if this i=0 is added to the for() below.
++	for (std::list<size_t>::iterator it = indexes.begin();
++			it != indexes.end() && i < num_frames; ++it, ++i) {
+ 		msg(LOG_INFO, "Routing Plane API: processing request %zu", i);
+ 
+ 		frame_reply = zmsg_pop(msg_reply);
+@@ -850,7 +1022,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 		}
+ 
+ 		unsigned int msg_type;
+-		ret = parse_frame(routing_data[i], zframe_data(frame_reply),
++		ret = parse_frame(routing_data[*it], zframe_data(frame_reply),
+ 				zframe_size(frame_reply), &msg_type);
+ 		if (BOOST_UNLIKELY(ret < 0 || msg_type != NF_ROUTE_RESPONSE)) {
+ 			/*
+@@ -867,6 +1039,48 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 			++good_frames;
+ 			msg(LOG_INFO, "Routing Plane API: parsed good frame from "
+ 					"Routing Plane, %d bytes read", ret);
++
++			routing_plane_data_t *new_node = (routing_plane_data_t *)calloc(
++					1, sizeof(routing_plane_data_t));
++			if (!new_node) {
++				THROWEXCEPTION("Could not allocate memory for Routing Plane"
++						"cache item!");
++			}
++			routing_plane_data_t_deep_copy(new_node, routing_data[*it], true);
++
++			cache_lock.lock();
++			if (BOOST_LIKELY(!cache_ip.count(pair<routing_plane_data_t *,
++					uint16_t>(routing_data[*it], 0)))) {
++				if (cache_subnet.count(routing_data[*it])) {
++					routing_plane_data_t *tmp =
++							(routing_plane_data_t *)cache_subnet[routing_data[*it]];
++					tmp->ip_count++;
++					tmp->ip_addresses = (ip46 *)realloc(tmp->ip_addresses,
++							sizeof(ip46) * tmp->ip_count);
++					if (!tmp->ip_addresses) {
++						THROWEXCEPTION("Could not allocate memory for Routing "
++								"Plane cache item!");
++					}
++					memcpy(&tmp->ip_addresses[tmp->ip_count - 1],
++							&routing_data[*it]->ip_addresses[0], sizeof(ip46));
++					cache_ip[pair<routing_plane_data_t *,
++							 uint16_t>(tmp, tmp->ip_count - 1)] = tmp;
++
++					cache_lock.unlock();
++					routing_plane_cleanup_data_t(new_node, true);
++					free(new_node);
++				} else {
++					cache_ip[pair<routing_plane_data_t *,
++							 uint16_t>(new_node, 0)] = new_node;
++					cache_subnet[new_node] = new_node;
++					cache_lock.unlock();
++				}
++				msg(LOG_INFO, "Routing Plane API: added new item to cache");
++			} else {
++				cache_lock.unlock();
++				routing_plane_cleanup_data_t(new_node, true);
++				free(new_node);
++			}
+ 		}
+ 		zframe_destroy(&frame_reply);
+ 	}
+@@ -944,7 +1158,7 @@ RoutingPlane::parse_update_reply (zmsg_t *msg_reply, size_t num_frames)
+ 			 * If there are problems in a frame, others might be valid, so we
+ 			 * do not exit immediately. Report and error and try to continue.
+ 			 */
+-			RoutingPlane::routing_plane_cleanup_data_t(routing_data);
++			RoutingPlane::routing_plane_cleanup_data_t(routing_data, true);
+ 			free(routing_data);
+ 			msg(LOG_NOTICE, "Routing Plane API: non-fatal error parsing frame "
+ 					"from Routing Plane: received malformed update frame");
+@@ -953,8 +1167,61 @@ RoutingPlane::parse_update_reply (zmsg_t *msg_reply, size_t num_frames)
+ 					"Routing Plane, %d bytes, updating Routing Plane cache",
+ 					ret);
+ 
+-			// TODO: add routing_data to cache!
+-			free(routing_data);
++			if (msg_type == NF_ROUTE_RESPONSE) {
++				RoutingPlane::cache_lock.lock();
++				if (RoutingPlane::cache_subnet.count(routing_data)) {
++					routing_plane_data_t *tmp =
++							(routing_plane_data_t *)
++							RoutingPlane::cache_subnet[routing_data];
++					RoutingPlane::routing_plane_cleanup_data_t(tmp, false);
++					routing_plane_data_t_deep_copy(tmp, routing_data, false);
++
++					RoutingPlane::cache_lock.unlock();
++					RoutingPlane::routing_plane_cleanup_data_t(routing_data,
++							true);
++					free(routing_data);
++					msg(LOG_INFO, "Routing Plane API: updated subnet in "
++							"cache");
++				} else {
++					RoutingPlane::cache_lock.unlock();
++					RoutingPlane::routing_plane_cleanup_data_t(routing_data,
++							true);
++					free(routing_data);
++					msg(LOG_INFO, "Routing Plane API: Routing Plane cache "
++							"replace skipped, subnet not found");
++				}
++			} else if (msg_type == NF_ROUTE_WITHDRAW) {
++				size_t rc = 0;
++
++				RoutingPlane::cache_lock.lock();
++				if (RoutingPlane::cache_subnet.count(routing_data)) {
++					routing_plane_data_t *tmp_route =
++							(routing_plane_data_t *)
++							RoutingPlane::cache_subnet[routing_data];
++					for (uint16_t i = 0; i < tmp_route->ip_count; ++i) {
++						RoutingPlane::cache_ip.erase(pair<routing_plane_data_t *,
++								uint16_t>(tmp_route, i));
++						msg(LOG_INFO, "Routing Plane API: removed IP from "
++								"cache");
++					}
++					rc = RoutingPlane::cache_subnet.erase(routing_data);
++
++					RoutingPlane::routing_plane_cleanup_data_t(tmp_route, true);
++					free(tmp_route);
++				}
++				RoutingPlane::cache_lock.unlock();
++
++				if (rc) {
++					msg(LOG_INFO, "Routing Plane API: removed subnet from "
++							"cache");
++				} else {
++					msg(LOG_INFO, "Routing Plane API: Routing Plane cache "
++							"withdrawal skipped, subnet not found");
++				}
++
++				RoutingPlane::routing_plane_cleanup_data_t(routing_data, true);
++				free(routing_data);
++			}
+ 
+ 			++good_frames;
+ 		}
+diff --git a/src/modules/ipfix/RoutingPlane.hpp b/src/modules/ipfix/RoutingPlane.hpp
+index e9f4531..8628442 100644
+--- a/src/modules/ipfix/RoutingPlane.hpp
++++ b/src/modules/ipfix/RoutingPlane.hpp
+@@ -25,6 +25,12 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <unordered_map>
++#include <utility>
++#include <boost/functional/hash.hpp>
++
++#include "common/Mutex.h"
++#include "common/ipfixlolib/encoding.h"
+ 
+ using namespace std;
+ 
+@@ -213,6 +219,12 @@ using namespace std;
+ typedef union {
+ 	struct in_addr addr;
+ 	struct in6_addr addr6;
++#if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++	unsigned __int128 v128;
++#pragma GCC diagnostic pop
++#endif
+ } ip46;
+ 
+ /*
+@@ -223,8 +235,9 @@ typedef union {
+  * before the response. The user of the API has to call
+  * routing_plane_cleanup_data_t in order to free them.
+  */
+-typedef struct {
+-	ip46 ip_address;
++typedef struct routing_plane_data_t {
++	ip46 ip_subnet;
++	ip46 *ip_addresses;
+ 	ip46 *ip_next_hops;
+ 	ip46 *bgp_next_hops;
+ 	char *vrf_name;
+@@ -232,6 +245,7 @@ typedef struct {
+ 	uint32_t adj_asn;
+ 	uint32_t vrf_id;
+ 	sa_family_t family;
++	uint16_t ip_count;
+ 	uint16_t ip_next_hop_count;
+ 	uint16_t bgp_next_hop_count;
+ 	uint16_t vrf_name_length;
+@@ -245,6 +259,117 @@ typedef struct {
+ #include <czmq.h>
+ 
+ 
++struct IpHasher
++{
++	std::size_t operator()(const std::pair<routing_plane_data_t *,
++			uint16_t>& pair) const
++	{
++		return boost::hash_range(
++				(uint8_t *)&pair.first->ip_addresses[pair.second],
++				(((uint8_t *)&pair.first->ip_addresses[pair.second])) +
++				(pair.first->family == AF_INET ?
++						sizeof(struct in_addr) : sizeof(struct in6_addr)));
++	}
++};
++
++struct SubnetHasher
++{
++	std::size_t operator()(const routing_plane_data_t *key) const
++	{
++		// enough for ipv6 + prefix length
++		uint8_t buffer[17];
++		memcpy(buffer, &key->ip_subnet, (key->family == AF_INET ?
++				sizeof(struct in_addr) : sizeof(struct in6_addr)));
++		buffer[(key->family == AF_INET ?
++				sizeof(struct in_addr) : sizeof(struct in6_addr))] =
++						key->prefix_length;
++
++		return boost::hash_range(buffer, buffer + (key->family == AF_INET ?
++				sizeof(struct in_addr) : sizeof(struct in6_addr)) + 1);
++	}
++};
++
++
++struct IpMatcher
++{
++	std::size_t operator()(const std::pair<routing_plane_data_t *,
++			uint16_t>& rhs, const std::pair<routing_plane_data_t *,
++			uint16_t>& lhs) const
++	{
++		if (rhs.first->family != lhs.first->family) {
++			return false;
++		}
++		if (rhs.first->pbr_table_id !=  lhs.first->pbr_table_id) {
++			return false;
++		}
++		if (rhs.first->vrf_name_length != lhs.first->vrf_name_length) {
++			return false;
++		}
++		if (rhs.first->vrf_id != lhs.first->vrf_id) {
++			return false;
++		}
++		if (memcmp(rhs.first->vrf_name, lhs.first->vrf_name,
++				rhs.first->vrf_name_length)) {
++			return false;
++		}
++		if (rhs.first->family == AF_INET) {
++			if (memcmp(&rhs.first->ip_addresses[rhs.second].addr,
++					&lhs.first->ip_addresses[lhs.second].addr,
++					sizeof(struct in_addr))){
++				return false;
++			}
++		} else if (rhs.first->family == AF_INET6) {
++			if (memcmp(&rhs.first->ip_addresses[rhs.second].addr6,
++					&lhs.first->ip_addresses[lhs.second].addr6,
++					sizeof(struct in6_addr))) {
++				return false;
++			}
++		} else {
++			return false;
++		}
++
++		return true;
++	}
++};
++
++struct SubnetMatcher
++{
++	std::size_t operator()(const routing_plane_data_t *rhs,
++			const routing_plane_data_t *lhs) const
++	{
++		if (rhs->family != lhs->family) {
++			return false;
++		}
++		if (rhs->pbr_table_id !=  lhs->pbr_table_id) {
++			return false;
++		}
++		if (rhs->vrf_name_length != lhs->vrf_name_length) {
++			return false;
++		}
++		if (rhs->vrf_id != lhs->vrf_id) {
++			return false;
++		}
++		if (memcmp(rhs->vrf_name, lhs->vrf_name, rhs->vrf_name_length)) {
++			return false;
++		}
++		if (rhs->family == AF_INET) {
++			if (memcmp(&rhs->ip_subnet.addr, &lhs->ip_subnet.addr,
++					sizeof(struct in_addr))){
++				return false;
++			}
++		} else if (rhs->family == AF_INET6) {
++			if (memcmp(&rhs->ip_subnet.addr6, &lhs->ip_subnet.addr6,
++					sizeof(struct in6_addr))) {
++				return false;
++			}
++		} else {
++			return false;
++		}
++
++		return true;
++	}
++};
++
+ class RoutingPlane
+ {
+ public:
+@@ -258,7 +383,8 @@ public:
+ 			int zmq_poll_timeout);
+ 	int get_data(routing_plane_data_t *routing_data[], size_t req_count,
+ 			uint16_t flags);
+-	static void routing_plane_cleanup_data_t(routing_plane_data_t *routing_data);
++	static void routing_plane_cleanup_data_t(routing_plane_data_t *routing_data,
++			bool clean_ip_addresses);
+ 
+ protected:
+ 	std::string zmq_sub_endpoint;
+@@ -275,6 +401,12 @@ private:
+ 	zsock_t *zmq_dealer_socket;
+ 	zsock_t *zmq_sub_socket;
+ 	zpoller_t *zpoller;
++
++	static std::unordered_map<std::pair<routing_plane_data_t *, uint16_t>,
++		routing_plane_data_t *, IpHasher, IpMatcher> cache_ip;
++	static std::unordered_map<routing_plane_data_t *, routing_plane_data_t *,
++		SubnetHasher, SubnetMatcher> cache_subnet;
++	static Mutex cache_lock;
+ };
+ 
+ #else // ZMQ_SUPPORT_ENABLED
+@@ -297,7 +429,8 @@ public:
+ 			uint16_t flags) {
+ 		THROWEXCEPTION("ZMQ not supported!");
+ 	}
+-	static void routing_plane_cleanup_data_t(routing_plane_data_t *routing_data) {
++	static void routing_plane_cleanup_data_t(routing_plane_data_t *routing_data,
++			bool clean_ip_addresses) {
+ 		THROWEXCEPTION("ZMQ not supported!");
+ 	}
+ };

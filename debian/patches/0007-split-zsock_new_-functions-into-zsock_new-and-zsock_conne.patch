@@ -1,0 +1,60 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Thu, 17 Jan 2019 19:35:00 +0000
+Subject: split zsock_new_ functions into zsock_new() and zsock_connect
+
+Works around a bug in ZMQ https://github.com/zeromq/libzmq/issues/2228
+
+Fixes VRVDR-44668
+---
+ src/modules/ipfix/RoutingPlane.cpp | 29 +++++++++++++++++++----------
+ 1 file changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/src/modules/ipfix/RoutingPlane.cpp b/src/modules/ipfix/RoutingPlane.cpp
+index c820afe..3b17bc9 100644
+--- a/src/modules/ipfix/RoutingPlane.cpp
++++ b/src/modules/ipfix/RoutingPlane.cpp
+@@ -94,25 +94,34 @@ RoutingPlane::setUpHelper ()
+ 				"Routing Plane interface");
+ 	}
+ 
+-	zmq_sub_socket = zsock_new_sub(zmq_sub_endpoint.c_str(), "");
++	zmq_sub_socket = zsock_new(ZMQ_SUB);
+ 	if (!zmq_sub_socket) {
+-		THROWEXCEPTION("Could not connect ZMQ SUB socket %s, cannot start "
+-				"Routing Plane interface",
+-				zmq_sub_endpoint.c_str());
++		THROWEXCEPTION("RoutingPlane: Could not create ZMQ SUB socket");
++	}
++
++	zsock_set_sndhwm(zmq_sub_socket, zmq_high_watermark);
++	zsock_set_rcvhwm(zmq_sub_socket, zmq_high_watermark);
++
++	if (zsock_connect(zmq_sub_socket, "%s", zmq_sub_endpoint.c_str())) {
++		THROWEXCEPTION("RoutingPlane: Could not connect ZMQ SUB socket %s",
++			zmq_sub_endpoint.c_str());
+ 	}
+ 
+-	zmq_dealer_socket = zsock_new_dealer(zmq_dealer_endpoint.c_str());
++	zsock_set_subscribe(zmq_sub_socket, "");
++
++	zmq_dealer_socket = zsock_new(ZMQ_DEALER);
+ 	if (!zmq_dealer_socket) {
+-		THROWEXCEPTION("Could not connect ZMQ DEALER socket %s, cannot start "
+-				"Routing Plane interface",
+-				zmq_dealer_endpoint.c_str());
++		THROWEXCEPTION("RoutingPlane: Could not create ZMQ DEALER socket");
+ 	}
+ 
+-	zsock_set_sndhwm(zmq_sub_socket, zmq_high_watermark);
+-	zsock_set_rcvhwm(zmq_sub_socket, zmq_high_watermark);
+ 	zsock_set_sndhwm(zmq_dealer_socket, zmq_high_watermark);
+ 	zsock_set_rcvhwm(zmq_dealer_socket, zmq_high_watermark);
+ 
++	if (zsock_connect(zmq_dealer_socket, "%s", zmq_dealer_endpoint.c_str())) {
++		THROWEXCEPTION("RoutingPlane: Could not connect ZMQ DEALER socket %s",
++			zmq_dealer_endpoint.c_str());
++	}
++
+ 	// discard buffered messages when socket is destroyed
+ 	zsock_set_linger(zmq_dealer_socket, 0);
+ 

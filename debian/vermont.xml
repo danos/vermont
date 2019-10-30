@@ -1,0 +1,12 @@
+<!-- Default install configuration -->
+<ipfixConfig>
+<sensorManager id="1">
+        <outputfile>/var/run/vermont/sensor_output.xml</outputfile>
+        <clearfilename>/var/run/vermont/sensor_clear.txt</clearfilename>
+        <checkinterval>1</checkinterval>
+</sensorManager>
+<!-- Collectors for interfaces -->
+<!-- Aggregators -->
+<!-- Exporters -->
+<!-- IPFIX UDP Collectors -->
+</ipfixConfig>

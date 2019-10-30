@@ -1,0 +1,854 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Fri, 31 Jul 2015 17:21:21 +0100
+Subject: Add IpfixEnhancer module
+
+---
+ src/modules/CMakeLists.txt             |   2 +
+ src/modules/ConfigManager.cpp          |   2 +
+ src/modules/ipfix/IpfixEnhancer.cpp    | 492 +++++++++++++++++++++++++++++++++
+ src/modules/ipfix/IpfixEnhancer.hpp    |  66 +++++
+ src/modules/ipfix/IpfixEnhancerCfg.cpp | 161 +++++++++++
+ src/modules/ipfix/IpfixEnhancerCfg.hpp |  61 ++++
+ 6 files changed, 784 insertions(+)
+ create mode 100644 src/modules/ipfix/IpfixEnhancer.cpp
+ create mode 100644 src/modules/ipfix/IpfixEnhancer.hpp
+ create mode 100644 src/modules/ipfix/IpfixEnhancerCfg.cpp
+ create mode 100644 src/modules/ipfix/IpfixEnhancerCfg.hpp
+
+diff --git a/src/modules/CMakeLists.txt b/src/modules/CMakeLists.txt
+index 4e85e39..ac0401d 100644
+--- a/src/modules/CMakeLists.txt
++++ b/src/modules/CMakeLists.txt
+@@ -97,6 +97,8 @@ ADD_LIBRARY(modules
+     ipfix/IpfixRecordAnonymizer.cpp
+     ipfix/NetflowV9Converter.cpp
+     ipfix/RoutingPlane.cpp
++    ipfix/IpfixEnhancerCfg.cpp
++    ipfix/IpfixEnhancer.cpp
+     ipfix/aggregator/PacketAggregatorCfg.cpp
+     ipfix/aggregator/AggregatorBaseCfg.cpp
+     ipfix/aggregator/IpfixAggregatorCfg.cpp
+diff --git a/src/modules/ConfigManager.cpp b/src/modules/ConfigManager.cpp
+index 88b5c66..8d8d3df 100644
+--- a/src/modules/ConfigManager.cpp
++++ b/src/modules/ConfigManager.cpp
+@@ -43,6 +43,7 @@
+ #include "modules/ipfix/IpfixSamplerCfg.h"
+ #include "modules/ipfix/IpfixCsExporterCfg.hpp"
+ #include "modules/ipfix/NetflowV9ConverterCfg.hpp"
++#include "modules/ipfix/IpfixEnhancerCfg.hpp"
+ #include "modules/ipfix/aggregator/IpfixAggregatorCfg.h"
+ #include "modules/ipfix/aggregator/PacketAggregatorCfg.h"
+ #include "modules/ipfix/database/IpfixDbReaderCfg.h"
+@@ -107,6 +108,7 @@ Cfg* ConfigManager::configModules[] = {
+ 	new IpfixFlowInspectorExporterCfg(NULL),
+ #endif
+ 	new FlowLenAnalyzerCfg(NULL),
++	new IpfixEnhancerCfg(NULL)
+ };
+ 
+ ConfigManager::ConfigManager()
+diff --git a/src/modules/ipfix/IpfixEnhancer.cpp b/src/modules/ipfix/IpfixEnhancer.cpp
+new file mode 100644
+index 0000000..56cb492
+--- /dev/null
++++ b/src/modules/ipfix/IpfixEnhancer.cpp
+@@ -0,0 +1,492 @@
++/*
++ * IPFIX enhancer module
++ * Copyright (C) 2015 Brocade Communications Systems
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ */
++
++#include "IpfixEnhancer.hpp"
++
++InstanceManager<IpfixDataRecord> IpfixEnhancer::dataRecordIM(
++		"IpfixEnhancerIpfixDataRecord", 0);
++InstanceManager<IpfixTemplateRecord> IpfixEnhancer::templateRecordIM(
++		"IpfixEnhancerIpfixTemplateRecord", 0);
++InstanceManager<IpfixTemplateDestructionRecord> IpfixEnhancer::templateDestructionRecordIM(
++		"IpfixEnhancerIpfixTemplateDestructionRecord", 0);
++
++IpfixEnhancer::IpfixEnhancer(std::list<InfoElementCfg> fields,
++		RoutingPlane *routing_plane)
++	: fields(fields), routing_plane(routing_plane)
++{
++}
++
++IpfixEnhancer::~IpfixEnhancer()
++{
++}
++
++void IpfixEnhancer::onTemplate(IpfixTemplateRecord* record)
++{
++	if (fields.empty()) {
++		send(record);
++		return;
++	}
++
++	std::list<InfoElementCfg> newFields(fields.begin(), fields.end());
++	boost::shared_ptr<TemplateInfo> templateInfo = record->templateInfo;
++	bool src_v4_addr_found, src_v6_addr_found, dst_v4_addr_found,
++		dst_v6_addr_found;
++
++	src_v4_addr_found =
++			templateInfo->getFieldInfo(IPFIX_TYPEID_sourceIPv4Address, 0) ?
++					true : false;
++
++	src_v6_addr_found =
++		templateInfo->getFieldInfo(IPFIX_TYPEID_sourceIPv6Address, 0) ?
++					true : false;
++
++	dst_v4_addr_found =
++			templateInfo->getFieldInfo(IPFIX_TYPEID_destinationIPv4Address, 0) ?
++					true : false;
++
++	dst_v6_addr_found =
++			templateInfo->getFieldInfo(IPFIX_TYPEID_destinationIPv6Address, 0) ?
++					true : false;
++
++	/*
++	 * newFields starts as a list of supported fields by the module.
++	 * We then remove all the fields that are already present in the received
++	 * template, since they won't need to be added.
++	 */
++	for (std::list<InfoElementCfg>::iterator it=newFields.begin();
++			it != newFields.end();) {
++		if (templateInfo->getFieldInfo((*it).getIeId(), 0)) {
++			it = newFields.erase(it);
++		} else {
++			++it;
++		}
++	}
++
++	/*
++	 * Remove all fields that are supported and present, but that we cannot
++	 * add due to missing dependencies that are needed to derive them.
++	 */
++	if (!src_v4_addr_found || !src_v6_addr_found) {
++		for (std::list<InfoElementCfg>::iterator it=newFields.begin();
++				it != newFields.end();) {
++			if ((((*it).getIeName() == "bgpSourceAsNumber" ||
++						(*it).getIeName() == "bgpPrevAdjacentAsNumber") &&
++						!src_v4_addr_found && !src_v6_addr_found) ||
++					((*it).getIeName() == "sourceIPv4PrefixLength" &&
++							!src_v4_addr_found) ||
++					((*it).getIeName() == "sourceIPv6PrefixLength" &&
++							!src_v6_addr_found)) {
++				it = newFields.erase(it);
++			} else {
++				++it;
++			}
++		}
++	}
++
++	if (!dst_v4_addr_found || !dst_v6_addr_found) {
++		for (std::list<InfoElementCfg>::iterator it=newFields.begin();
++				it != newFields.end();) {
++			if ((((*it).getIeName() == "bgpDestinationAsNumber" ||
++						(*it).getIeName() == "bgpNextAdjacentAsNumber") &&
++						!src_v4_addr_found && !src_v6_addr_found) ||
++					(((*it).getIeName() == "destinationIPv4PrefixLength" ||
++							(*it).getIeName() == "ipNextHopIPv4Address" ||
++							(*it).getIeName() == "bgpNextHopIPv4Address") &&
++							!src_v4_addr_found) ||
++					(((*it).getIeName() == "destinationIPv6PrefixLength" ||
++							(*it).getIeName() == "ipNextHopIPv6Address" ||
++							(*it).getIeName() == "bgpNextHopIPv6Address") &&
++							!src_v6_addr_found)) {
++				it = newFields.erase(it);
++			} else {
++				++it;
++			}
++		}
++	}
++
++	if (newFields.empty()) {
++		msg(LOG_INFO, "IpfixEnhancer: Received Template (id=%u) does not have,"
++				" required fields, skip enhancing.", templateInfo->templateId);
++		send(record);
++		return;
++	}
++
++	if(uniqueIdToEnhanceInfo.find(templateInfo->getUniqueId()) !=
++			uniqueIdToEnhanceInfo.end()) {
++		msg(LOG_ERR, "IpfixEnhancer: Received known Template (id=%u) again, "
++				"which should not happen.", templateInfo->templateId);
++		record->removeReference();
++		return;
++	}
++
++	// Generate new Template, starting with a copy of the Template
++	boost::shared_ptr<TemplateInfo> newTemplateInfo(
++			new TemplateInfo(*templateInfo.get()));
++
++	// Make unique
++	newTemplateInfo->setUniqueId();
++
++	// Generate conversion info
++	EnhanceInfo myEnhanceInfo;
++	myEnhanceInfo.templateInfo = newTemplateInfo;
++	myEnhanceInfo.newFields = newFields;
++	myEnhanceInfo.additionalDataLength = 0;
++
++	/*
++	 * Compute the additional length of the resulting record for later reuse
++	 * when enhancing the actual records.
++	 */
++	for (std::list<InfoElementCfg>::iterator it=newFields.begin();
++			it != newFields.end(); ++it) {
++		myEnhanceInfo.additionalDataLength += (*it).getIeLength();
++	}
++
++
++	newTemplateInfo->fieldInfo = (TemplateInfo::FieldInfo*)realloc(
++			newTemplateInfo->fieldInfo,
++			(newTemplateInfo->fieldCount + newFields.size()) *
++			sizeof(TemplateInfo::FieldInfo));
++	if (newTemplateInfo->fieldInfo == NULL) {
++		THROWEXCEPTION("Could not allocate memory for new fields!");
++	}
++
++	TemplateInfo::FieldInfo newField;
++	newField.isVariableLength = false;
++	newField.type.enterprise = 0;
++	newField.privDataOffset = 0;
++
++	/*
++	 * Add all the new fields at the end of the template, while computing the
++	 * resulting offset of the data in the records.
++	 */
++	for (std::list<InfoElementCfg>::iterator it=newFields.begin();
++			it != newFields.end(); ++it) {
++		newField.type.id = (*it).getIeId();
++		newField.type.length = (*it).getIeLength();
++		newField.offset =
++			newTemplateInfo->fieldInfo[newTemplateInfo->fieldCount - 1].offset +
++			newTemplateInfo->fieldInfo[newTemplateInfo->fieldCount - 1].type.length;
++		memcpy(&newTemplateInfo->fieldInfo[newTemplateInfo->fieldCount],
++				&newField, sizeof(TemplateInfo::FieldInfo));
++		++newTemplateInfo->fieldCount;
++	}
++
++	// Save conversion info in map
++	uniqueIdToEnhanceInfo[templateInfo->getUniqueId()] = myEnhanceInfo;
++
++	// Generate and send new Template record
++	IpfixTemplateRecord* newTemplateRecord = templateRecordIM.getNewInstance();
++	newTemplateRecord->sourceID = record->sourceID;
++	newTemplateRecord->templateInfo = newTemplateInfo;
++	send(newTemplateRecord);
++
++	// Release original Template record
++	record->removeReference();
++}
++
++void IpfixEnhancer::onTemplateDestruction(
++		IpfixTemplateDestructionRecord* record)
++{
++	if (fields.empty()) {
++		send(record);
++		return;
++	}
++
++	boost::shared_ptr<TemplateInfo> templateInfo = record->templateInfo;
++	// This should be a known Template for us
++	map<uint16_t, EnhanceInfo>::iterator iter =
++			uniqueIdToEnhanceInfo.find(templateInfo->getUniqueId());
++	if(iter == uniqueIdToEnhanceInfo.end()) {
++		send(record);
++		return;
++	}
++
++	// Generate and send Template destruction record
++	IpfixTemplateDestructionRecord* newTemplateDestructionRecord =
++			templateDestructionRecordIM.getNewInstance();
++	newTemplateDestructionRecord->sourceID = record->sourceID;
++	newTemplateDestructionRecord->templateInfo = iter->second.templateInfo;
++	send(newTemplateDestructionRecord);
++
++	// Delete conversion info from map
++	uniqueIdToEnhanceInfo.erase(iter);
++
++	// Release original Template record
++	record->removeReference();
++}
++
++void IpfixEnhancer::onDataRecord(IpfixDataRecord* record)
++{
++	if (fields.empty()) {
++		send(record);
++		return;
++	}
++
++	IpfixDataRecord* myRecord;
++	boost::shared_ptr<TemplateInfo> templateInfo = record->templateInfo;
++	IpfixRecord::Data* data = record->data;
++
++	map<uint16_t, EnhanceInfo>::iterator iter =
++			uniqueIdToEnhanceInfo.find(templateInfo->getUniqueId());
++	if(iter == uniqueIdToEnhanceInfo.end()) {
++		msg(LOG_ERR, "IpfixEnhancer: Received Data Record associated to "
++				"unknown Template (id=%u), which should not happen.",
++				templateInfo->templateId);
++		record->removeReference();
++		return;
++	}
++
++	if (iter->second.newFields.empty()) {
++		send(record);
++		return;
++	}
++
++	/*
++	 * However unlikely and strange it might be, a flow with both v4 and v6
++	 * addresses is possible in theory, so we have to support it.
++	 */
++	routing_plane_data_t *routing_plane_data[4] = {NULL, NULL, NULL, NULL},
++		routing_plane_data_src_v4, routing_plane_data_dst_v4,
++		routing_plane_data_src_v6, routing_plane_data_dst_v6;
++	size_t routing_plane_count = 0;
++	ip46 src_v4, dst_v4, src_v6, dst_v6;
++
++	memset(&routing_plane_data_src_v4, 0, sizeof(routing_plane_data_t));
++	memset(&routing_plane_data_dst_v4, 0, sizeof(routing_plane_data_t));
++	memset(&routing_plane_data_src_v6, 0, sizeof(routing_plane_data_t));
++	memset(&routing_plane_data_dst_v6, 0, sizeof(routing_plane_data_t));
++
++	routing_plane_data_src_v4.ip_count = 1;
++	routing_plane_data_dst_v4.ip_count = 1;
++	routing_plane_data_src_v6.ip_count = 1;
++	routing_plane_data_dst_v6.ip_count = 1;
++
++	routing_plane_data_src_v4.ip_addresses = &src_v4;
++	routing_plane_data_dst_v4.ip_addresses = &dst_v4;
++	routing_plane_data_src_v6.ip_addresses = &src_v6;
++	routing_plane_data_dst_v6.ip_addresses = &dst_v6;
++
++	for (int i = 0; i < templateInfo->fieldCount; i++) {
++		TemplateInfo::FieldInfo* fi = &templateInfo->fieldInfo[i];
++
++		if (fi->type.id == IPFIX_TYPEID_sourceIPv4Address) {
++			memcpy(&routing_plane_data_src_v4.ip_addresses[0].addr.s_addr,
++					data + fi->offset, fi->type.length);
++			routing_plane_data_src_v4.family = AF_INET;
++			routing_plane_data[routing_plane_count++] =
++					&routing_plane_data_src_v4;
++		} else if (fi->type.id == IPFIX_TYPEID_destinationIPv4Address) {
++			memcpy(&routing_plane_data_dst_v4.ip_addresses[0].addr.s_addr,
++					data + fi->offset, fi->type.length);
++			routing_plane_data_dst_v4.family = AF_INET;
++			routing_plane_data[routing_plane_count++] =
++					&routing_plane_data_dst_v4;
++		} else if (fi->type.id == IPFIX_TYPEID_sourceIPv6Address) {
++			memcpy(&routing_plane_data_src_v6.ip_addresses[0],
++					data + fi->offset, fi->type.length);
++			routing_plane_data_src_v6.family = AF_INET6;
++			routing_plane_data[routing_plane_count++] =
++					&routing_plane_data_src_v6;
++		} else if (fi->type.id == IPFIX_TYPEID_destinationIPv6Address) {
++			memcpy(&routing_plane_data_dst_v6.ip_addresses[0],
++					data + fi->offset, fi->type.length);
++			routing_plane_data_dst_v6.family = AF_INET6;
++			routing_plane_data[routing_plane_count++] =
++					&routing_plane_data_dst_v6;
++		} else if (fi->type.id == IPFIX_TYPEID_ingressVRFID) {
++			memcpy(&routing_plane_data_src_v4.vrf_id,
++					data + fi->offset, fi->type.length);
++			memcpy(&routing_plane_data_src_v6.vrf_id,
++					data + fi->offset, fi->type.length);
++		} else if (fi->type.id == IPFIX_TYPEID_egressVRFID) {
++			memcpy(&routing_plane_data_dst_v4.vrf_id,
++					data + fi->offset, fi->type.length);
++			memcpy(&routing_plane_data_dst_v6.vrf_id,
++					data + fi->offset, fi->type.length);
++		}
++	}
++
++	int rc = routing_plane->get_data(routing_plane_data, routing_plane_count,
++			NF_DATA_TYPE_ALL_FIELDS);
++
++	if (rc) {
++		send(record);
++		RoutingPlane::routing_plane_cleanup_data_t(&routing_plane_data_src_v4,
++				false);
++		RoutingPlane::routing_plane_cleanup_data_t(&routing_plane_data_src_v6,
++				false);
++		RoutingPlane::routing_plane_cleanup_data_t(&routing_plane_data_dst_v4,
++				false);
++		RoutingPlane::routing_plane_cleanup_data_t(&routing_plane_data_dst_v6,
++				false);
++		return;
++	}
++
++	myRecord = dataRecordIM.getNewInstance();
++	myRecord->sourceID = record->sourceID;
++	myRecord->templateInfo = iter->second.templateInfo;
++	myRecord->dataLength = record->dataLength +
++			iter->second.additionalDataLength;
++	myRecord->message = boost::shared_array<IpfixRecord::Data>(
++			new IpfixRecord::Data[myRecord->dataLength]);
++	memcpy(myRecord->message.get(), record->data, record->dataLength);
++	myRecord->data = myRecord->message.get();
++	data = myRecord->data;
++	record->removeReference();
++
++	/*
++	 * This is a bit terrible, especially since it is in the critical code path,
++	 * but there's really not much that can be done. We need to loop over all
++	 * the fields in the record, and then if it matches one of the fields we
++	 * have marked as enhanced we copy the data.
++	 */
++	for (int i = 0; i < myRecord->templateInfo->fieldCount; ++i) {
++		TemplateInfo::FieldInfo* fi = &myRecord->templateInfo->fieldInfo[i];
++
++		for (std::list<InfoElementCfg>::iterator it =
++				iter->second.newFields.begin();
++				it != iter->second.newFields.end(); ++it) {
++			if (fi->type.id == (*it).getIeId()) {
++				switch (fi->type.id) {
++				case IPFIX_TYPEID_bgpSourceAsNumber:
++					if (routing_plane_data_src_v4.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_src_v4.host_asn,
++								fi->type.length);
++					} else if (routing_plane_data_src_v6.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_src_v6.host_asn,
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_bgpDestinationAsNumber:
++					if (routing_plane_data_dst_v4.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v4.host_asn,
++								fi->type.length);
++					} else if (routing_plane_data_dst_v6.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v6.host_asn,
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_sourceIPv4PrefixLength:
++					if (routing_plane_data_src_v4.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_src_v4.prefix_length,
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_sourceIPv6PrefixLength:
++					if (routing_plane_data_src_v6.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_src_v6.prefix_length,
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_destinationIPv4PrefixLength:
++					if (routing_plane_data_dst_v4.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v4.prefix_length,
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_destinationIPv6PrefixLength:
++					if (routing_plane_data_dst_v6.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v6.prefix_length,
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_bgpPrevAdjacentAsNumber:
++					if (routing_plane_data_src_v4.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_src_v4.adj_asn,
++								fi->type.length);
++					} else if (routing_plane_data_src_v6.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_src_v6.adj_asn,
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_bgpNextAdjacentAsNumber:
++					if (routing_plane_data_dst_v4.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v4.adj_asn,
++								fi->type.length);
++					} else if (routing_plane_data_dst_v6.family != 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v6.adj_asn,
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_ipNextHopIPv4Address:
++					if (routing_plane_data_dst_v4.ip_next_hop_count > 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v4.ip_next_hops[0],
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_ipNextHopIPv6Address:
++					if (routing_plane_data_dst_v6.ip_next_hop_count > 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v6.ip_next_hops[0],
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_bgpNextHopIPv4Address:
++					if (routing_plane_data_dst_v4.bgp_next_hop_count > 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v4.bgp_next_hops[0],
++								fi->type.length);
++					}
++					break;
++				case IPFIX_TYPEID_bgpNextHopIPv6Address:
++					if (routing_plane_data_dst_v6.bgp_next_hop_count > 0) {
++						memcpy(data + fi->offset,
++								&routing_plane_data_dst_v6.bgp_next_hops[0],
++								fi->type.length);
++					}
++					break;
++				default:
++					break;
++				}
++			}
++		}
++	}
++
++	RoutingPlane::routing_plane_cleanup_data_t(&routing_plane_data_src_v4,
++			false);
++	RoutingPlane::routing_plane_cleanup_data_t(&routing_plane_data_src_v6,
++			false);
++	RoutingPlane::routing_plane_cleanup_data_t(&routing_plane_data_dst_v4,
++			false);
++	RoutingPlane::routing_plane_cleanup_data_t(&routing_plane_data_dst_v6,
++			false);
++
++	send(myRecord);
++}
++
++void IpfixEnhancer::onReconfiguration2()
++{
++	// we do not need to destroy templates during reconfiguration
++	// forget all conversion info
++	uniqueIdToEnhanceInfo.clear();
++}
+diff --git a/src/modules/ipfix/IpfixEnhancer.hpp b/src/modules/ipfix/IpfixEnhancer.hpp
+new file mode 100644
+index 0000000..115374f
+--- /dev/null
++++ b/src/modules/ipfix/IpfixEnhancer.hpp
+@@ -0,0 +1,66 @@
++/*
++ * IPFIX enhancer module
++ * Copyright (C) 2015 Brocade Communications Systems
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ */
++
++#ifndef _IPFIXENHANCER_H_
++#define _IPFIXENHANCER_H_
++
++#include <map>
++
++#include <core/InfoElementCfg.h>
++#include "core/Source.h"
++#include "modules/ipfix/IpfixRecordDestination.h"
++#include "modules/ipfix/RoutingPlane.hpp"
++
++class IpfixEnhancer : public Source<IpfixRecord*>,
++		public IpfixRecordDestination, public Module  {
++public:
++	IpfixEnhancer(std::list<InfoElementCfg> fields = std::list<InfoElementCfg>(),
++			RoutingPlane *routing_plane = NULL);
++	virtual ~IpfixEnhancer();
++	virtual void onReconfiguration2();
++
++protected:
++	virtual void onTemplate(IpfixTemplateRecord* record);
++	virtual void onDataRecord(IpfixDataRecord* record);
++	virtual void onTemplateDestruction(IpfixTemplateDestructionRecord* record);
++
++	static InstanceManager<IpfixDataRecord> dataRecordIM;
++	static InstanceManager<IpfixTemplateRecord> templateRecordIM;
++	static InstanceManager<IpfixTemplateDestructionRecord> templateDestructionRecordIM;
++
++	struct EnhanceInfo {
++		// IPFIX Template
++		boost::shared_ptr<TemplateInfo> templateInfo;
++
++		// fields to add to this template
++		std::list<InfoElementCfg> newFields;
++
++		// store data length of the new fields
++		uint32_t additionalDataLength;
++	};
++
++	std::map<uint16_t, EnhanceInfo> uniqueIdToEnhanceInfo;
++
++private:
++	std::list<InfoElementCfg> fields;
++	RoutingPlane *routing_plane;
++};
++
++#endif // _IPFIXENHANCER_H_
+diff --git a/src/modules/ipfix/IpfixEnhancerCfg.cpp b/src/modules/ipfix/IpfixEnhancerCfg.cpp
+new file mode 100644
+index 0000000..09d9e51
+--- /dev/null
++++ b/src/modules/ipfix/IpfixEnhancerCfg.cpp
+@@ -0,0 +1,161 @@
++/*
++ * IPFIX enhancer module
++ * Copyright (C) 2015 Brocade Communications Systems
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ */
++
++#include "IpfixEnhancerCfg.hpp"
++
++/*
++ * Static array to match supported fields
++ */
++const std::set<string> supported_fields = {
++		"ipNextHopIPv4Address", "bgpNextHopIPv4Address",
++		"sourceIPv4PrefixLength", "destinationIPv4PrefixLength",
++		"bgpSourceAsNumber", "bgpDestinationAsNumber",
++		"bgpPrevAdjacentAsNumber", "bgpNextAdjacentAsNumber",
++		"ipNextHopIPv6Address", "bgpNextHopIPv6Address",
++		"sourceIPv6PrefixLength", "destinationIPv6PrefixLength"
++};
++
++IpfixEnhancerCfg* IpfixEnhancerCfg::create(XMLElement* e)
++{
++	assert(e);
++	assert(e->getName() == getName());
++	return new IpfixEnhancerCfg(e);
++}
++
++IpfixEnhancerCfg::IpfixEnhancerCfg(XMLElement* elem)
++	: CfgHelper<IpfixEnhancer, IpfixEnhancerCfg>(elem, "ipfixEnhancer"),
++	  zmqSubEndpoint(""), zmqReqEndpoint(""),
++	  zmqHighWaterMark(0), zmqPollTimeout(RP_ZMQ_POLL_TIMEOUT_DEFAULT),
++	  rpCacheWipingInterval(RP_CACHE_CLEAN_INTERVAL_DEFAULT)
++{
++	if (!elem) {
++		return;
++	}
++
++	routing_plane = NULL;
++	bool enable_routing_plane = false;
++
++	XMLNode::XMLSet<XMLElement*> set = elem->getElementChildren();
++	for (XMLNode::XMLSet<XMLElement*>::iterator it = set.begin();
++			it != set.end();
++			it++) {
++		XMLElement* e = *it;
++		if (e->matches("routingPlane") && !enable_routing_plane) {
++#ifdef ZMQ_SUPPORT_ENABLED
++			XMLNode::XMLSet<XMLElement*> sub_set = e->getElementChildren();
++			for (XMLNode::XMLSet<XMLElement*>::iterator sub_it = sub_set.begin();
++					sub_it != sub_set.end();
++					sub_it++) {
++				XMLElement* sub_e = *sub_it;
++				if (sub_e->matches("zmqSubEndpoint")) {
++					zmqSubEndpoint = sub_e->getContent();
++				} else if (sub_e->matches("zmqReqEndpoint")) {
++					zmqReqEndpoint = sub_e->getContent();
++				} else if (sub_e->matches("zmqHighWaterMark")) {
++					zmqHighWaterMark = atoi(sub_e->getContent().c_str());
++				} else if (sub_e->matches("zmqPollTimeout")) {
++					zmqPollTimeout = atoi(sub_e->getContent().c_str());
++				} else if (sub_e->matches("cacheWipingInterval")) {
++					rpCacheWipingInterval = atoi(sub_e->getContent().c_str());
++				} else {
++					msg(LOG_CRIT, "Unknown IpfixEnhancer config statement "
++							"%s\n", sub_e->getName().c_str());
++					continue;
++				}
++			}
++			enable_routing_plane = true;
++#else
++			THROWEXCEPTION("ZMQ not supported, cannot use RoutingPlane!");
++#endif
++		} else if (e->matches("fieldsList")) {
++			XMLNode::XMLSet<XMLElement*> sub_set = e->getElementChildren();
++			for (XMLNode::XMLSet<XMLElement*>::iterator sub_it = sub_set.begin();
++					sub_it != sub_set.end();
++					sub_it++) {
++				XMLElement* sub_e = *sub_it;
++				if (sub_e->matches("field")) {
++					InfoElementCfg ie(sub_e);
++					if (!ie.isKnownIE() ||
++							supported_fields.find(ie.getIeName()) ==
++									supported_fields.end()) {
++						msg(LOG_CRIT, "Unsupported IpfixEnhancer field %s "
++								"(id=%u, ent=%" PRIu32 ").",
++								(ie.getIeName()).c_str(),
++								ie.getIeId(), ie.getEnterpriseNumber());
++						continue;
++					}
++					fields.push_back(ie);
++				} else {
++					msg(LOG_CRIT, "Unsupported IpfixEnhancer option %s\n",
++							sub_e->getName().c_str());
++					continue;
++				}
++			}
++		} else if (e->matches("next")) { // ignore next
++		} else {
++			msg(LOG_CRIT, "Unknown IpfixEnhancer config statement %s\n",
++					e->getName().c_str());
++			continue;
++		}
++	}
++
++	if (enable_routing_plane &&
++			(zmqSubEndpoint.empty() || zmqReqEndpoint.empty())) {
++		THROWEXCEPTION("Cannot configure RoutingPlane without ZMQ endpoints");
++	}
++}
++
++IpfixEnhancerCfg::~IpfixEnhancerCfg()
++{
++	if (routing_plane) {
++		msg(LOG_NOTICE, "Deleting Routing Plane");
++		delete routing_plane;
++	} else {
++		msg(LOG_NOTICE, "No Routing Plane to delete");
++	}
++}
++
++IpfixEnhancer* IpfixEnhancerCfg::createInstance()
++{
++	if (!zmqSubEndpoint.empty() && !zmqReqEndpoint.empty()) {
++		if (routing_plane == NULL) {
++			routing_plane = new RoutingPlane(zmqSubEndpoint, zmqReqEndpoint,
++					zmqHighWaterMark, zmqPollTimeout, rpCacheWipingInterval);
++		} else {
++			routing_plane->reconfigure(zmqSubEndpoint, zmqReqEndpoint,
++					zmqHighWaterMark, zmqPollTimeout, rpCacheWipingInterval);
++		}
++	}
++	instance = new IpfixEnhancer(fields, routing_plane);
++	return instance;
++}
++
++bool IpfixEnhancerCfg::deriveFrom(IpfixEnhancerCfg* old)
++{
++	if (zmqSubEndpoint == old->zmqSubEndpoint &&
++			zmqReqEndpoint == old->zmqReqEndpoint &&
++			zmqHighWaterMark == old->zmqHighWaterMark &&
++			zmqPollTimeout == old->zmqPollTimeout &&
++			fields == old->fields) {
++		return true;
++	} else {
++		return false;
++	}
++}
+diff --git a/src/modules/ipfix/IpfixEnhancerCfg.hpp b/src/modules/ipfix/IpfixEnhancerCfg.hpp
+new file mode 100644
+index 0000000..5596df6
+--- /dev/null
++++ b/src/modules/ipfix/IpfixEnhancerCfg.hpp
+@@ -0,0 +1,61 @@
++/*
++ * IPFIX enhancer module
++ * Copyright (C) 2015 Brocade Communications Systems
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ */
++
++#ifndef _IPFIXENHANCERCFG_H_
++#define _IPFIXENHANCERCFG_H_
++
++#include <core/XMLElement.h>
++#include <core/Cfg.h>
++#include <core/InfoElementCfg.h>
++
++#include "modules/ipfix/IpfixEnhancer.hpp"
++#include "modules/ipfix/RoutingPlane.hpp"
++
++#include <string>
++
++using namespace std;
++
++class IpfixEnhancerCfg
++	: public CfgHelper<IpfixEnhancer, IpfixEnhancerCfg>
++{
++public:
++	friend class ConfigManager;
++
++	virtual IpfixEnhancerCfg* create(XMLElement* e);
++	virtual ~IpfixEnhancerCfg();
++
++	virtual IpfixEnhancer* createInstance();
++	virtual bool deriveFrom(IpfixEnhancerCfg* old);
++
++	RoutingPlane *routing_plane;
++
++protected:
++	std::list<InfoElementCfg> fields;
++	std::string zmqSubEndpoint;
++	std::string zmqReqEndpoint;
++	int zmqHighWaterMark;
++	int zmqPollTimeout;
++	uint32_t rpCacheWipingInterval;
++
++	IpfixEnhancerCfg(XMLElement*);
++};
++
++
++#endif // _IPFIXENHANCERCFG_H_

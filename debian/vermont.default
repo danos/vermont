@@ -1,0 +1,10 @@
+# Defaults for vermont initscript
+# sourced by /etc/init.d/vermont
+# installed at /etc/default/vermont by the maintainer scripts
+
+#
+# This is a POSIX shell fragment
+#
+
+# Additional options that are passed to the Daemon.
+DAEMON_OPTS="-d -f /etc/vermont/vermont.xml"

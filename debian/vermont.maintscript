@@ -1,0 +1,2 @@
+rm_conffile /etc/rsyslog.d/vermont.conf 20170605-0vyatta2
+rm_conffile /etc/logrotate.d/vermont 20170605-0vyatta2

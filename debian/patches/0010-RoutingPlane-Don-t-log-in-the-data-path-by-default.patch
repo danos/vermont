@@ -1,0 +1,358 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Wed, 30 Jan 2019 13:38:08 +0000
+Subject: RoutingPlane: Don't log in the data path by default
+
+---
+ src/modules/ipfix/RoutingPlane.cpp | 80 +++++++++++++++++++-------------------
+ 1 file changed, 40 insertions(+), 40 deletions(-)
+
+diff --git a/src/modules/ipfix/RoutingPlane.cpp b/src/modules/ipfix/RoutingPlane.cpp
+index 49a65a8..358eceb 100644
+--- a/src/modules/ipfix/RoutingPlane.cpp
++++ b/src/modules/ipfix/RoutingPlane.cpp
+@@ -289,7 +289,7 @@ RoutingPlane::routing_plane_cleanup_data_t (routing_plane_data_t *routing_data,
+ 		bool clean_ip_addresses)
+ {
+ 	if (routing_data) {
+-		msg(LOG_INFO, "Routing Plane API: freeing routing_data buffers");
++		DPRINTF_DEBUG("Routing Plane API: freeing routing_data buffers");
+ 
+ 		if (clean_ip_addresses && routing_data->ip_count) {
+ 			free(routing_data->ip_addresses);
+@@ -358,7 +358,7 @@ set_subnet_from_ip_prefix (routing_plane_data_t *routing_data)
+ 
+ 	inet_ntop(routing_data->family, &routing_data->ip_subnet, debug_buffer,
+ 			40);
+-	msg(LOG_INFO, "Routing Plane API: parsing response: subnet %s",
++	DPRINTF_DEBUG("Routing Plane API: parsing response: subnet %s",
+ 			debug_buffer);
+ }
+ 
+@@ -397,7 +397,7 @@ parse_ip_address (bool *parsed_ip, uint16_t ip_length,
+ 		if (!memcmp(&routing_data->ip_addresses[i], data, ip_length)) {
+ 			inet_ntop(routing_data->family, &routing_data->ip_addresses[i],
+ 					debug_buffer, 40);
+-			msg(LOG_INFO, "Routing Plane API: parsing response: IP %s",
++			DPRINTF_DEBUG("Routing Plane API: parsing response: IP %s",
+ 					debug_buffer);
+ 			*parsed_ip = true;
+ 			return true;
+@@ -429,7 +429,7 @@ parse_vrf_name (uint16_t data_length, routing_plane_data_t *routing_data,
+ 	memcpy(routing_data->vrf_name, data, data_length);
+ 	routing_data->vrf_name[data_length] = '\0';
+ 
+-	msg(LOG_INFO, "Routing Plane API: parsing response: VRF %s",
++	DPRINTF_DEBUG("Routing Plane API: parsing response: VRF %s",
+ 			routing_data->vrf_name);
+ 
+ 	return true;
+@@ -458,7 +458,7 @@ parse_ip_nexthop (uint16_t data_length, uint16_t ip_length,
+ 				ip_length);
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: parsing response: %u IP next hop parsed",
++	DPRINTF_DEBUG("Routing Plane API: parsing response: %u IP next hop parsed",
+ 			routing_data->ip_next_hop_count);
+ 
+ 	return true;
+@@ -488,7 +488,7 @@ parse_bgp_nexthop (uint16_t data_length, uint16_t ip_length,
+ 				ip_length);
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: parsing response: %u BGP next hop "
++	DPRINTF_DEBUG("Routing Plane API: parsing response: %u BGP next hop "
+ 			"parsed", routing_data->bgp_next_hop_count);
+ 
+ 	return true;
+@@ -553,7 +553,7 @@ parse_data (routing_plane_data_t *routing_data, uint8_t *data,
+ 		case NF_DATA_TYPE_PBR_TABLE_ID:
+ 			routing_data->pbr_table_id = *data;
+ 
+-			msg(LOG_INFO, "Routing Plane API: parsing response: PBR ID %u",
++			DPRINTF_DEBUG("Routing Plane API: parsing response: PBR ID %u",
+ 					routing_data->pbr_table_id);
+ 
+ 			break;
+@@ -572,7 +572,7 @@ parse_data (routing_plane_data_t *routing_data, uint8_t *data,
+ 			}
+ 			routing_data->vrf_id = *(uint32_t *)data;
+ 
+-			msg(LOG_INFO, "Routing Plane API: parsing response: VRF ID %u",
++			DPRINTF_DEBUG("Routing Plane API: parsing response: VRF ID %u",
+ 					ntohl(routing_data->vrf_id));
+ 
+ 			break;
+@@ -582,7 +582,7 @@ parse_data (routing_plane_data_t *routing_data, uint8_t *data,
+ 			}
+ 			routing_data->host_asn = *(uint32_t *)data;
+ 
+-			msg(LOG_INFO, "Routing Plane API: parsing response: host ASN %u",
++			DPRINTF_DEBUG("Routing Plane API: parsing response: host ASN %u",
+ 					ntohl(routing_data->host_asn));
+ 
+ 			break;
+@@ -592,14 +592,14 @@ parse_data (routing_plane_data_t *routing_data, uint8_t *data,
+ 			}
+ 			routing_data->adj_asn = *(uint32_t *)data;
+ 
+-			msg(LOG_INFO, "Routing Plane API: parsing response: BGP adjacent "
++			DPRINTF_DEBUG("Routing Plane API: parsing response: BGP adjacent "
+ 					"ASN %u", ntohl(routing_data->adj_asn));
+ 
+ 			break;
+ 		case NF_DATA_TYPE_SUBNET_MASK:
+ 			routing_data->prefix_length = *data;
+ 
+-			msg(LOG_INFO, "Routing Plane API: parsing response: prefix length "
++			DPRINTF_DEBUG("Routing Plane API: parsing response: prefix length "
+ 					"%u", routing_data->prefix_length);
+ 
+ 			break;
+@@ -674,7 +674,7 @@ parse_frame (routing_plane_data_t *routing_data, uint8_t *reply,
+ 	int ret;
+ 	sa_family_t family;
+ 
+-	msg(LOG_INFO, "Routing Plane API: parsing response: ZMQ frame size %zu "
++	DPRINTF_DEBUG("Routing Plane API: parsing response: ZMQ frame size %zu "
+ 			"bytes", reply_size);
+ 
+ 	/*
+@@ -695,7 +695,7 @@ parse_frame (routing_plane_data_t *routing_data, uint8_t *reply,
+ 	}
+ 
+ 	family = NF_MSG_GET_HEADER_AF(reply);
+-	msg(LOG_INFO, "Routing Plane API: parsing response: AF family %u", family);
++	DPRINTF_DEBUG("Routing Plane API: parsing response: AF family %u", family);
+ 	if (family != AF_INET && family != AF_INET6) {
+ 		return ROUTING_PLANE_ERROR_UNKNOWN_AF;
+ 	}
+@@ -707,7 +707,7 @@ parse_frame (routing_plane_data_t *routing_data, uint8_t *reply,
+ 	 * We need at the very least one IP address in a response to proceed.
+ 	 */
+ 	payload_length = NF_MSG_GET_HEADER_LENGTH(reply);
+-	msg(LOG_INFO, "Routing Plane API: parsing response: payload length %zu",
++	DPRINTF_DEBUG("Routing Plane API: parsing response: payload length %zu",
+ 			payload_length);
+ 	if (BOOST_UNLIKELY(payload_length < NF_DATA_HEADER_LENGTH + ip_length)) {
+ 		return ROUTING_PLANE_ERROR_REPLY_NO_IP;
+@@ -799,7 +799,7 @@ create_request (uint16_t request_type, routing_plane_data_t *routing_data,
+ 	} else {
+ 		return ROUTING_PLANE_ERROR_UNKNOWN_AF;
+ 	}
+-	msg(LOG_INFO, "Routing Plane API: parsing request: AF family %u",
++	DPRINTF_DEBUG("Routing Plane API: parsing request: AF family %u",
+ 			routing_data->family);
+ 
+ 	if (routing_data->pbr_table_id) {
+@@ -814,7 +814,7 @@ create_request (uint16_t request_type, routing_plane_data_t *routing_data,
+ 		*buffer_size += NF_DATA_HEADER_LENGTH + NF_VRF_ID_LENGTH;
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: parsing request: payload length %zu",
++	DPRINTF_DEBUG("Routing Plane API: parsing request: payload length %zu",
+ 			*buffer_size - NF_MSG_HEADER_LENGTH);
+ 
+ 	/*
+@@ -857,7 +857,7 @@ create_request (uint16_t request_type, routing_plane_data_t *routing_data,
+ 
+ 	inet_ntop(routing_data->family, &routing_data->ip_addresses[0],
+ 			debug_buffer, 40);
+-	msg(LOG_INFO, "Routing Plane API: parsing request: IP %s", debug_buffer);
++	DPRINTF_DEBUG("Routing Plane API: parsing request: IP %s", debug_buffer);
+ 
+ 
+ 	if (routing_data->pbr_table_id) {
+@@ -866,7 +866,7 @@ create_request (uint16_t request_type, routing_plane_data_t *routing_data,
+ 		offset += NF_DATA_HEADER_LENGTH;
+ 		memcpy(buffer + offset, &routing_data->pbr_table_id,
+ 				NF_PBR_TABLE_ID_LENGTH);
+-		msg(LOG_INFO, "Routing Plane API: parsing request: PBR ID %u",
++		DPRINTF_DEBUG("Routing Plane API: parsing request: PBR ID %u",
+ 				routing_data->pbr_table_id);
+ 		offset += NF_PBR_TABLE_ID_LENGTH;
+ 	}
+@@ -878,7 +878,7 @@ create_request (uint16_t request_type, routing_plane_data_t *routing_data,
+ 		offset += NF_DATA_HEADER_LENGTH;
+ 		memcpy(buffer + offset, routing_data->vrf_name,
+ 				routing_data->vrf_name_length);
+-		msg(LOG_INFO, "Routing Plane API: parsing request: VRF %s",
++		DPRINTF_DEBUG("Routing Plane API: parsing request: VRF %s",
+ 				routing_data->vrf_name);
+ 		offset += routing_data->vrf_name_length;
+ 	}
+@@ -889,7 +889,7 @@ create_request (uint16_t request_type, routing_plane_data_t *routing_data,
+ 		offset += NF_DATA_HEADER_LENGTH;
+ 		memcpy(buffer + offset, &routing_data->vrf_id,
+ 				NF_VRF_ID_LENGTH);
+-		msg(LOG_INFO, "Routing Plane API: parsing request: VRF ID %u",
++		DPRINTF_DEBUG("Routing Plane API: parsing request: VRF ID %u",
+ 				ntohl(routing_data->vrf_id));
+ 		offset += NF_VRF_ID_LENGTH;
+ 	}
+@@ -932,7 +932,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 		goto error;
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: processing %zu requests for data, with "
++	DPRINTF_INFO("Routing Plane API: processing %zu requests for data, with "
+ 			"flags %u", req_count, flags);
+ 
+ 	/*
+@@ -957,7 +957,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 	 * to change in a list.
+ 	 */
+ 	for (i = 0; i < req_count; ++i) {
+-		msg(LOG_INFO, "Routing Plane API: processing request %zu", i);
++		DPRINTF_DEBUG("Routing Plane API: processing request %zu", i);
+ 
+ 		cache_lock.lock();
+ 		if (cache_ip.count(pair<routing_plane_data_t *,
+@@ -987,12 +987,12 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 	}
+ 
+ 	if (indexes.empty()) {
+-		msg(LOG_INFO, "Routing Plane API: 100%% cache hit, no message sent");
++		DPRINTF_INFO("Routing Plane API: 100%% cache hit, no message sent");
+ 		ret = 0;
+ 		goto error;
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: sending %zu frames in one message to "
++	DPRINTF_INFO("Routing Plane API: sending %zu frames in one message to "
+ 			"Routing Plane", indexes.size());
+ 
+ 	ret = zmsg_send(&msg_request, zmq_dealer_socket);
+@@ -1001,7 +1001,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 		goto error;
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: blocking on zmsg_recv waiting for "
++	DPRINTF_INFO("Routing Plane API: blocking on zmsg_recv waiting for "
+ 			"response from Routing Plane");
+ 
+ 	/*
+@@ -1032,11 +1032,11 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 		goto error;
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: received response from Routing Plane, "
++	DPRINTF_INFO("Routing Plane API: received response from Routing Plane, "
+ 			"one msg with %zu frames",
+ 			num_frames);
+ 
+-	msg(LOG_INFO, "Routing Plane API: resetting input routing_data before "
++	DPRINTF_DEBUG("Routing Plane API: resetting input routing_data before "
+ 			"parsing response");
+ 
+ 	/*
+@@ -1055,7 +1055,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 	i = 0; // refuses to compile if this i=0 is added to the for() below.
+ 	for (std::list<size_t>::iterator it = indexes.begin();
+ 			it != indexes.end() && i < num_frames; ++it, ++i) {
+-		msg(LOG_INFO, "Routing Plane API: processing request %zu", i);
++		DPRINTF_DEBUG("Routing Plane API: processing request %zu", i);
+ 
+ 		frame_reply = zmsg_pop(msg_reply);
+ 		if (BOOST_UNLIKELY(!frame_reply)) {
+@@ -1085,7 +1085,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 			 * there were none we can report an error.
+ 			 */
+ 			++good_frames;
+-			msg(LOG_INFO, "Routing Plane API: parsed good frame from "
++			DPRINTF_DEBUG("Routing Plane API: parsed good frame from "
+ 					"Routing Plane, %d bytes read", ret);
+ 
+ 			routing_plane_data_t *new_node = (routing_plane_data_t *)calloc(
+@@ -1123,7 +1123,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 					cache_subnet[new_node] = new_node;
+ 					cache_lock.unlock();
+ 				}
+-				msg(LOG_INFO, "Routing Plane API: added new item to cache");
++				DPRINTF_INFO("Routing Plane API: added new item to cache");
+ 			} else {
+ 				cache_lock.unlock();
+ 				routing_plane_cleanup_data_t(new_node, true);
+@@ -1138,7 +1138,7 @@ RoutingPlane::get_data (routing_plane_data_t *routing_data[],
+ 		goto error;
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: processed %zu good frames from "
++	DPRINTF_DEBUG("Routing Plane API: processed %zu good frames from "
+ 			"Routing Plane, returning", good_frames);
+ 
+ 	ret = 0;
+@@ -1175,7 +1175,7 @@ RoutingPlane::parse_update_reply (zmsg_t *msg_reply, size_t num_frames)
+ 	 * expect one frame per address update.
+ 	 */
+ 	for (i = 0; i < num_frames; ++i) {
+-		msg(LOG_INFO, "Routing Plane API: processing update %zu", i);
++		msg(LOG_DEBUG, "Routing Plane API: processing update %zu", i);
+ 
+ 		frame_reply = zmsg_pop(msg_reply);
+ 		if (BOOST_UNLIKELY(!frame_reply)) {
+@@ -1211,7 +1211,7 @@ RoutingPlane::parse_update_reply (zmsg_t *msg_reply, size_t num_frames)
+ 			msg(LOG_NOTICE, "Routing Plane API: non-fatal error parsing frame "
+ 					"from Routing Plane: received malformed update frame");
+ 		} else {
+-			msg(LOG_INFO, "Routing Plane API: parsed good update frame from "
++			msg(LOG_DEBUG, "Routing Plane API: parsed good update frame from "
+ 					"Routing Plane, %d bytes, updating Routing Plane cache",
+ 					ret);
+ 
+@@ -1228,14 +1228,14 @@ RoutingPlane::parse_update_reply (zmsg_t *msg_reply, size_t num_frames)
+ 					RoutingPlane::routing_plane_cleanup_data_t(routing_data,
+ 							true);
+ 					free(routing_data);
+-					msg(LOG_INFO, "Routing Plane API: updated subnet in "
++					msg(LOG_DEBUG, "Routing Plane API: updated subnet in "
+ 							"cache");
+ 				} else {
+ 					RoutingPlane::cache_lock.unlock();
+ 					RoutingPlane::routing_plane_cleanup_data_t(routing_data,
+ 							true);
+ 					free(routing_data);
+-					msg(LOG_INFO, "Routing Plane API: Routing Plane cache "
++					msg(LOG_DEBUG, "Routing Plane API: Routing Plane cache "
+ 							"replace skipped, subnet not found");
+ 				}
+ 			} else if (msg_type == NF_ROUTE_WITHDRAW) {
+@@ -1260,10 +1260,10 @@ RoutingPlane::parse_update_reply (zmsg_t *msg_reply, size_t num_frames)
+ 				RoutingPlane::cache_lock.unlock();
+ 
+ 				if (rc) {
+-					msg(LOG_INFO, "Routing Plane API: removed subnet from "
++					msg(LOG_DEBUG, "Routing Plane API: removed subnet from "
+ 							"cache");
+ 				} else {
+-					msg(LOG_INFO, "Routing Plane API: Routing Plane cache "
++					msg(LOG_DEBUG, "Routing Plane API: Routing Plane cache "
+ 							"withdrawal skipped, subnet not found");
+ 				}
+ 
+@@ -1286,7 +1286,7 @@ RoutingPlane::routing_plane_process_update (zsock_t *sock)
+ 	size_t num_frames;
+ 	int ret = 0;
+ 
+-	msg(LOG_INFO, "Routing Plane API: reading message from Routing Plane "
++	msg(LOG_DEBUG, "Routing Plane API: reading message from Routing Plane "
+ 			"PUB-SUB ZMQ socket");
+ 
+ 	msg_reply = zmsg_recv(sock);
+@@ -1304,7 +1304,7 @@ RoutingPlane::routing_plane_process_update (zsock_t *sock)
+ 		goto error;
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: received update from Routing Plane, one "
++	msg(LOG_DEBUG, "Routing Plane API: received update from Routing Plane, one "
+ 			"msg with %zu frames", num_frames);
+ 
+ 	ret = parse_update_reply(msg_reply, num_frames);
+@@ -1313,7 +1313,7 @@ RoutingPlane::routing_plane_process_update (zsock_t *sock)
+ 		goto error;
+ 	}
+ 
+-	msg(LOG_INFO, "Routing Plane API: processed all frames from Routing Plane "
++	msg(LOG_DEBUG, "Routing Plane API: processed all frames from Routing Plane "
+ 			"update, returning");
+ 
+ error:

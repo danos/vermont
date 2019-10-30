@@ -1,0 +1,251 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Tue, 4 Aug 2015 16:09:29 +0100
+Subject: Add SUB thread to Routing Plane module
+
+---
+ src/modules/ipfix/RoutingPlane.cpp | 102 +++++++++++++++++++++++++++++++++++--
+ src/modules/ipfix/RoutingPlane.hpp |  21 ++++++--
+ 2 files changed, 115 insertions(+), 8 deletions(-)
+
+diff --git a/src/modules/ipfix/RoutingPlane.cpp b/src/modules/ipfix/RoutingPlane.cpp
+index fd1b94d..c820afe 100644
+--- a/src/modules/ipfix/RoutingPlane.cpp
++++ b/src/modules/ipfix/RoutingPlane.cpp
+@@ -60,6 +60,31 @@ std::unordered_map<routing_plane_data_t *, routing_plane_data_t *,
+ 	SubnetHasher, SubnetMatcher> RoutingPlane::cache_subnet;
+ Mutex RoutingPlane::cache_lock;
+ 
++
++void
++RoutingPlane::clear_cache ()
++{
++	msg(LOG_INFO, "Routing Plane API: beginning cache clear");
++
++	RoutingPlane::cache_lock.lock();
++
++	for (auto &it : RoutingPlane::cache_subnet) {
++		routing_plane_data_t *tmp_route =
++				(routing_plane_data_t *)RoutingPlane::cache_subnet[it.second];
++		RoutingPlane::cache_subnet[tmp_route] = NULL;
++		RoutingPlane::routing_plane_cleanup_data_t(tmp_route, true);
++		free(tmp_route);
++	}
++
++	RoutingPlane::cache_subnet.clear();
++	// Content is pointers to the same elements of cache_subnet
++	RoutingPlane::cache_ip.clear();
++
++	RoutingPlane::cache_lock.unlock();
++
++	msg(LOG_INFO, "Routing Plane API: finished cache clear");
++}
++
+ void
+ RoutingPlane::setUpHelper ()
+ {
+@@ -98,11 +123,18 @@ RoutingPlane::setUpHelper ()
+ 
+ 	msg(LOG_NOTICE, "RoutingPlane listening on %s", zmq_sub_endpoint.c_str());
+ 	msg(LOG_NOTICE, "RoutingPlane connected to %s", zmq_dealer_endpoint.c_str());
++
++	exitFlag = false;
++	thread.run(this);
+ }
+ 
+ void
+ RoutingPlane::tearDownHelper ()
+ {
++	// stop pub-sub thread
++	exitFlag = true;
++	thread.join();
++
+ 	zpoller_destroy(&zpoller);
+ 	zsock_destroy(&zmq_sub_socket);
+ 	zsock_destroy(&zmq_dealer_socket);
+@@ -112,10 +144,12 @@ RoutingPlane::tearDownHelper ()
+ 
+ RoutingPlane::RoutingPlane(std::string zmq_sub_endpoint,
+ 		std::string zmq_dealer_endpoint, int zmq_high_watermark,
+-		int zmq_poll_timeout)
++		int zmq_poll_timeout, uint32_t cache_wiping_interval)
+ : zmq_sub_endpoint(zmq_sub_endpoint),
+   zmq_dealer_endpoint(zmq_dealer_endpoint),
+-  zmq_high_watermark(zmq_high_watermark), zmq_poll_timeout(zmq_poll_timeout)
++  zmq_high_watermark(zmq_high_watermark), zmq_poll_timeout(zmq_poll_timeout),
++  cache_wiping_interval(cache_wiping_interval),
++  thread(threadWrapper, "RPUpdater")
+ {
+ 	if (zmq_sub_endpoint.empty() || zmq_dealer_endpoint.empty()) {
+ 		THROWEXCEPTION("Need DEALER and SUB endpoints, cannot start "
+@@ -136,7 +170,7 @@ RoutingPlane::~RoutingPlane()
+ void
+ RoutingPlane::reconfigure(std::string zmq_dealer_endpoint,
+ 		std::string zmq_sub_endpoint, int zmq_high_watermark,
+-		int zmq_poll_timeout)
++		int zmq_poll_timeout, uint32_t cache_wiping_interval)
+ {
+ 	if (zmq_dealer_endpoint.empty() || zmq_sub_endpoint.empty()) {
+ 		THROWEXCEPTION("Need DEALER and SUB endpoints, cannot start "
+@@ -156,6 +190,10 @@ RoutingPlane::reconfigure(std::string zmq_dealer_endpoint,
+ 		zsock_set_rcvhwm(zmq_dealer_socket, zmq_high_watermark);
+ 	}
+ 
++	if (this->cache_wiping_interval != cache_wiping_interval) {
++		this->cache_wiping_interval = cache_wiping_interval;
++	}
++
+ 	if (this->zmq_dealer_endpoint != zmq_dealer_endpoint ||
+ 			this->zmq_sub_endpoint != zmq_sub_endpoint) {
+ 		tearDownHelper();
+@@ -361,6 +399,7 @@ parse_ip_address (bool *parsed_ip, uint16_t ip_length,
+ 			40);
+ 	msg(LOG_ERR, "Routing Plane API: parsed IP does not match: %s",
+ 			debug_buffer);
++
+ 	return false;
+ }
+ 
+@@ -1285,4 +1324,61 @@ error:
+ 	return ret;
+ }
+ 
++/**
++ * ZMQ specific listener function. This function is called by @c listenerThread
++ */
++void
++RoutingPlane::run()
++{
++	timeval last_cleared, now;
++	gettimeofday(&last_cleared, 0);
++
++	while (!zsys_interrupted && !exitFlag) {
++		void *sock = zpoller_wait(zpoller, zmq_poll_timeout);
++		if (!sock) {
++			if (zpoller_terminated(zpoller)) {
++				msg(LOG_INFO, "Routing Plane: ZMQ termination signal received");
++				break;
++			} else {
++				if (cache_wiping_interval > 0) {
++					gettimeofday(&now, 0);
++					if (last_cleared.tv_sec + cache_wiping_interval <
++							now.tv_sec) {
++						clear_cache();
++						gettimeofday(&last_cleared, 0);
++					}
++				}
++				continue;
++			}
++		}
++
++		int rc = routing_plane_process_update((zsock_t *)sock);
++		if (rc < 0) {
++			msg(LOG_ERR, "Routing Plane: Empty ZMQ SUB message");
++		}
++
++		if (cache_wiping_interval > 0) {
++			gettimeofday(&now, 0);
++			if (last_cleared.tv_sec + cache_wiping_interval < now.tv_sec) {
++				clear_cache();
++				gettimeofday(&last_cleared, 0);
++			}
++		}
++	}
++}
++
++/**
++ * Thread function responsible for receiving packets from the Routing Plane SUB
++ * @param routingPlane_ pointer to a RoutingPlane instance
++ * @return NULL
++ */
++void *
++RoutingPlane::threadWrapper(void *routingPlane_) {
++	RoutingPlane *routingPlane = (RoutingPlane *)routingPlane_;
++
++	routingPlane->run();
++
++	return NULL;
++}
++
+ #endif // ZMQ_SUPPORT_ENABLED
+diff --git a/src/modules/ipfix/RoutingPlane.hpp b/src/modules/ipfix/RoutingPlane.hpp
+index 8628442..03f078b 100644
+--- a/src/modules/ipfix/RoutingPlane.hpp
++++ b/src/modules/ipfix/RoutingPlane.hpp
+@@ -26,9 +26,10 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <unordered_map>
+-#include <utility>
+ #include <boost/functional/hash.hpp>
++#include <utility>
+ 
++#include "common/Thread.h"
+ #include "common/Mutex.h"
+ #include "common/ipfixlolib/encoding.h"
+ 
+@@ -212,6 +213,8 @@ using namespace std;
+ 
+ // default poll timeout, 1 second
+ #define RP_ZMQ_POLL_TIMEOUT_DEFAULT 1000
++// default cache cleaning interval, default disabled
++#define RP_CACHE_CLEAN_INTERVAL_DEFAULT 0
+ 
+ /*
+  * 16 bytes union, useful since a request can be either AF_INET or AF_INET6.
+@@ -376,31 +379,38 @@ public:
+ 	RoutingPlane(std::string zmq_sub_endpoint = std::string(),
+ 			std::string zmq_dealer_endpoint = std::string(),
+ 			int zmq_high_watermark = 0,
+-			int zmq_poll_timeout = RP_ZMQ_POLL_TIMEOUT_DEFAULT);
++			int zmq_poll_timeout = RP_ZMQ_POLL_TIMEOUT_DEFAULT,
++			uint32_t cache_wiping_interval = RP_CACHE_CLEAN_INTERVAL_DEFAULT);
+ 	virtual ~RoutingPlane();
+ 	void reconfigure(std::string zmq_sub_endpoint,
+ 			std::string zmq_dealer_endpoint, int zmq_high_watermark,
+-			int zmq_poll_timeout);
++			int zmq_poll_timeout, uint32_t cache_wiping_interval);
+ 	int get_data(routing_plane_data_t *routing_data[], size_t req_count,
+ 			uint16_t flags);
+ 	static void routing_plane_cleanup_data_t(routing_plane_data_t *routing_data,
+ 			bool clean_ip_addresses);
++	virtual void run();
+ 
+ protected:
+ 	std::string zmq_sub_endpoint;
+ 	std::string zmq_dealer_endpoint;
+ 	int zmq_high_watermark;
+ 	int zmq_poll_timeout;
++	uint32_t cache_wiping_interval;
++	bool exitFlag;
+ 
+ private:
++	static void *threadWrapper(void *instance);
+ 	int parse_update_reply(zmsg_t *msg_reply, size_t num_frames);
+ 	int routing_plane_process_update(zsock_t *sock);
+ 	void setUpHelper();
+ 	void tearDownHelper();
++	void clear_cache();
+ 
+ 	zsock_t *zmq_dealer_socket;
+ 	zsock_t *zmq_sub_socket;
+ 	zpoller_t *zpoller;
++	Thread thread;
+ 
+ 	static std::unordered_map<std::pair<routing_plane_data_t *, uint16_t>,
+ 		routing_plane_data_t *, IpHasher, IpMatcher> cache_ip;
+@@ -417,12 +427,13 @@ public:
+ 	RoutingPlane(std::string zmq_sub_endpoint = std::string(),
+ 			std::string zmq_dealer_endpoint = std::string(),
+ 			int zmq_high_watermark = 0,
+-			int zmq_poll_timeout = RP_ZMQ_POLL_TIMEOUT_DEFAULT) {
++			int zmq_poll_timeout = RP_ZMQ_POLL_TIMEOUT_DEFAULT,
++			uint32_t cache_wiping_interval = RP_CACHE_CLEAN_INTERVAL_DEFAULT) {
+ 		THROWEXCEPTION("ZMQ not supported!");
+ 	}
+ 	void reconfigure(std::string zmq_sub_endpoint,
+ 			std::string zmq_dealer_endpoint, int zmq_high_watermark,
+-			int zmq_poll_timeout) {
++			int zmq_poll_timeout, uint32_t cache_wiping_interval) {
+ 		THROWEXCEPTION("ZMQ not supported!");
+ 	}
+ 	int get_data(routing_plane_data_t *routing_data[], size_t req_count,

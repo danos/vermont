@@ -1,0 +1,127 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Thu, 14 Dec 2017 10:04:40 +0000
+Subject: Support-for-exporting-over-Routing-Domain-VRF
+
+---
+ CMakeLists.txt                      | 31 +++++++++++++++++++++++++++++++
+ src/common/ipfixlolib/ipfixlolib.c  | 27 ++++++++++++++++++++++++++-
+ src/modules/ipfix/CollectorCfg.h    |  2 +-
+ src/tests/ipfixlolib/CMakeLists.txt |  7 +++++++
+ 4 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d87ec02..9157317 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -176,6 +176,37 @@ IF (ENABLE_VRF)
+ ENDIF (ENABLE_VRF)
+ CHECK_INCLUDE_FILE("linux/if.h" LINUX_IF_H_FOUND "-include sys/socket.h")
+ 
++### Routing Domain (VRF) support
++
++OPTION(ENABLE_ROUTING_DOMAIN "Enable support for Kernel Routing Domain (VRF). Warning: requires support in runtime kernel for SO_RTDOMAIN !" OFF)
++IF (ENABLE_ROUTING_DOMAIN)
++	CHECK_SYMBOL_EXISTS("SO_RTDOMAIN" "sys/socket.h" SO_RTDOMAIN_FOUND)
++	IF (SO_RTDOMAIN_FOUND)
++		ADD_DEFINITIONS(-DENABLE_ROUTING_DOMAIN)
++
++		# the VRF manager is used to translate VRF name to RTDM ID
++		FIND_PACKAGE(PkgConfig REQUIRED)
++		PKG_CHECK_MODULES(VRF_MANAGER libvrfmanager-vyatta)
++		IF (NOT VRF_MANAGER_FOUND)
++			MESSAGE(FATAL_ERROR "Could not find libvrfmanager-vyatta")
++		ELSE (NOT VRF_MANAGER_FOUND)
++			MESSAGE(STATUS "Found libvrfmanager-vyatta")
++		ENDIF (NOT VRF_MANAGER_FOUND)
++		IF (VRF_MANAGER_FOUND)
++			ADD_DEFINITIONS(-DVRF_MANAGER_ENABLED)
++			LINK_DIRECTORIES(${VRF_MANAGER_LIBRARY_DIRS})
++			INCLUDE_DIRECTORIES(${VRF_MANAGER_INCLUDE_DIRS})
++			TARGET_LINK_LIBRARIES(vermont
++				${VRF_MANAGER_LIBRARIES}
++			)
++		ELSE (VRF_MANAGER_FOUND)
++			REMOVE_DEFINITIONS(-DVRF_MANAGER_ENABLED)
++		ENDIF (VRF_MANAGER_FOUND)
++	ELSE (SO_RTDOMAIN_FOUND)
++		MESSAGE(WARNING "SO_RTDOMAIN not found in sys/socket.h, will not build with ENABLE_ROUTING_DOMAIN. Check Linux Kernel's userspace headers (eg: linux-libc-dev)")
++	ENDIF (SO_RTDOMAIN_FOUND)
++ENDIF (ENABLE_ROUTING_DOMAIN)
++
+ ### MongoDB
+ 
+ OPTION(SUPPORT_MONGO "Enable MongoDB support" OFF)
+diff --git a/src/common/ipfixlolib/ipfixlolib.c b/src/common/ipfixlolib/ipfixlolib.c
+index 5d019aa..049b4c7 100644
+--- a/src/common/ipfixlolib/ipfixlolib.c
++++ b/src/common/ipfixlolib/ipfixlolib.c
+@@ -53,6 +53,9 @@
+ #include <unistd.h>
+ #include <stdbool.h>
+ #include <inttypes.h>
++#ifdef VRF_MANAGER_ENABLED
++#include <vrf_manager.h>
++#endif
+ 
+ #ifdef SUPPORT_DTLS
+ #include "ipfixlolib_dtls_private.h"
+@@ -118,7 +121,29 @@ static int init_vrf(int socket, char *vrf_name, char *vrf_log_buffer) {
+         if (strlen(vrf_name) == 0)
+             return 0; // do not return an error on nothing to do, valid call
+ 
+-#if defined(ENABLE_VRF) && defined(SO_BINDTODEVICE)
++#if defined(ENABLE_ROUTING_DOMAIN) && defined(SO_RTDOMAIN) && defined(VRF_MANAGER_ENABLED)
++        snprintf(vrf_log_buffer, VRF_LOG_LEN, "[%.*s] ", IFNAMSIZ, vrf_name);
++        uint32_t vrf_id = get_vrf_id(vrf_name);
++        if (vrf_id == VRFID_INVALID) {
++                msg(LOG_CRIT, "%scannot find VRF %s",
++                                vrf_log_buffer, vrf_name);
++                close(socket);
++                return -1;
++        }
++        if (setsockopt(socket, SOL_SOCKET, SO_RTDOMAIN, &vrf_id,
++                        sizeof(uint32_t))) {
++                if (errno == ENOPROTOOPT) {
++                        msg(LOG_ERR, "VRF not implemented in local kernel");
++                } else {
++                        msg(LOG_CRIT, "%ssetsockopt VRF %s failed, %s",
++                                        vrf_log_buffer, vrf_name,
++                                        strerror(errno));
++                        close(socket);
++                        return -1;
++                }
++        }
++	return 0;
++#elif defined(ENABLE_VRF) && defined(SO_BINDTODEVICE)
+         snprintf(vrf_log_buffer, VRF_LOG_LEN, "[%.*s] ", IFNAMSIZ, vrf_name);
+         if (setsockopt(socket, SOL_SOCKET, SO_BINDTODEVICE, vrf_name,
+                         strlen(vrf_name))) {
+diff --git a/src/modules/ipfix/CollectorCfg.h b/src/modules/ipfix/CollectorCfg.h
+index bf36c95..e530453 100644
+--- a/src/modules/ipfix/CollectorCfg.h
++++ b/src/modules/ipfix/CollectorCfg.h
+@@ -63,7 +63,7 @@ public:
+ 			if (e->matches("ipAddress")) {
+ 				ipAddress = e->getContent();
+ 			} else if (e->matches("vrfName")) {
+-#if defined(ENABLE_VRF)
++#if defined(ENABLE_VRF) || defined(ENABLE_ROUTING_DOMAIN)
+ 				vrfName = e->getContent();
+ 				if (vrfName.length() == 0)
+ 					THROWEXCEPTION("Invalid configuration parameter for vrfName"
+diff --git a/src/tests/ipfixlolib/CMakeLists.txt b/src/tests/ipfixlolib/CMakeLists.txt
+index d51bac7..e4b662e 100644
+--- a/src/tests/ipfixlolib/CMakeLists.txt
++++ b/src/tests/ipfixlolib/CMakeLists.txt
+@@ -55,4 +55,11 @@ IF (JOURNALD_FOUND)
+ 	TARGET_LINK_LIBRARIES(example_code_2 ${JOURNALD_LIBRARIES})
+ ENDIF (JOURNALD_FOUND)
+ 
++IF (VRF_MANAGER_FOUND)
++	TARGET_LINK_LIBRARIES(test_everything ${VRF_MANAGER_LIBRARIES})
++	TARGET_LINK_LIBRARIES(mtutest ${VRF_MANAGER_LIBRARIES})
++	TARGET_LINK_LIBRARIES(example_code ${VRF_MANAGER_LIBRARIES})
++	TARGET_LINK_LIBRARIES(example_code_2 ${VRF_MANAGER_LIBRARIES})
++ENDIF (VRF_MANAGER_FOUND)
++
+ ADD_TEST(example_2 example_code_2)

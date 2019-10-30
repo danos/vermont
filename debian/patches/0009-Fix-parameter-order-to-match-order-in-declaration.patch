@@ -1,0 +1,24 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Thu, 17 Jan 2019 19:33:47 +0000
+Subject: Fix parameter order to match order in declaration
+
+cppcheck warning
+---
+ src/modules/ipfix/RoutingPlane.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/modules/ipfix/RoutingPlane.cpp b/src/modules/ipfix/RoutingPlane.cpp
+index 822fd90..49a65a8 100644
+--- a/src/modules/ipfix/RoutingPlane.cpp
++++ b/src/modules/ipfix/RoutingPlane.cpp
+@@ -177,8 +177,8 @@ RoutingPlane::~RoutingPlane()
+ }
+ 
+ void
+-RoutingPlane::reconfigure(std::string zmq_dealer_endpoint,
+-		std::string zmq_sub_endpoint, int zmq_high_watermark,
++RoutingPlane::reconfigure(std::string zmq_sub_endpoint,
++		std::string zmq_dealer_endpoint, int zmq_high_watermark,
+ 		int zmq_poll_timeout, uint32_t cache_wiping_interval)
+ {
+ 	if (zmq_dealer_endpoint.empty() || zmq_sub_endpoint.empty()) {

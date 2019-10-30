@@ -1,0 +1,1364 @@
+From: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Date: Fri, 24 Jul 2015 17:38:36 +0100
+Subject: Add Routing Plane class module
+
+---
+ src/modules/CMakeLists.txt         |    1 +
+ src/modules/ipfix/RoutingPlane.cpp | 1021 ++++++++++++++++++++++++++++++++++++
+ src/modules/ipfix/RoutingPlane.hpp |  307 +++++++++++
+ 3 files changed, 1329 insertions(+)
+ create mode 100644 src/modules/ipfix/RoutingPlane.cpp
+ create mode 100644 src/modules/ipfix/RoutingPlane.hpp
+
+diff --git a/src/modules/CMakeLists.txt b/src/modules/CMakeLists.txt
+index 826a20e..4e85e39 100644
+--- a/src/modules/CMakeLists.txt
++++ b/src/modules/CMakeLists.txt
+@@ -96,6 +96,7 @@ ADD_LIBRARY(modules
+     ipfix/IpfixPayloadWriter.cpp
+     ipfix/IpfixRecordAnonymizer.cpp
+     ipfix/NetflowV9Converter.cpp
++    ipfix/RoutingPlane.cpp
+     ipfix/aggregator/PacketAggregatorCfg.cpp
+     ipfix/aggregator/AggregatorBaseCfg.cpp
+     ipfix/aggregator/IpfixAggregatorCfg.cpp
+diff --git a/src/modules/ipfix/RoutingPlane.cpp b/src/modules/ipfix/RoutingPlane.cpp
+new file mode 100644
+index 0000000..d7d8089
+--- /dev/null
++++ b/src/modules/ipfix/RoutingPlane.cpp
+@@ -0,0 +1,1021 @@
++/*
++ * Routing Plane interface class
++ * Copyright (C) 2015 Brocade Communications Systems
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ */
++
++#ifdef ZMQ_SUPPORT_ENABLED
++
++#include <czmq.h>
++#include <boost/config.hpp>
++
++#include "RoutingPlane.hpp"
++#include "common/msg.h"
++#include "common/Time.h"
++
++/*
++ * Static array, used to easily match an error code to a human readable string,
++ * for debug and logging purposes.
++ */
++const char* routing_plane_errors[] = {
++		"ROUTING_PLANE_SUCCESS",
++		"ROUTING_PLANE_ERROR_GENERAL",
++		"ROUTING_PLANE_ERROR_ZMQ_API",
++		"ROUTING_PLANE_ERROR_INPUT",
++		"ROUTING_PLANE_INFO_TIMEOUT",
++		"ROUTING_PLANE_INFO_INTERRUPTED",
++		"ROUTING_PLANE_MISMATCHING_AF",
++		"ROUTING_PLANE_ERROR_EMPTY_REPLY",
++		"ROUTING_PLANE_ERROR_UNKNOWN_AF",
++		"ROUTING_PLANE_ERROR_INVALID_ARGUMENT",
++		"ROUTING_PLANE_ERROR_INVALID_REP_TYPE",
++		"ROUTING_PLANE_ERROR_INVALID_REP_SIZE",
++		"ROUTING_PLANE_ERROR_REPLY_NO_IP",
++		"ROUTING_PLANE_ERROR_REPLY_MULTIPLE_IP",
++		"ROUTING_PLANE_ERROR_INVALID_FLAGS"
++};
++
++
++void
++RoutingPlane::setUpHelper ()
++{
++	zpoller = zpoller_new(NULL);
++	if (!zpoller) {
++		THROWEXCEPTION("Could not create ZMQ poller, cannot start "
++				"Routing Plane interface");
++	}
++
++	zmq_sub_socket = zsock_new_sub(zmq_sub_endpoint.c_str(), "");
++	if (!zmq_sub_socket) {
++		THROWEXCEPTION("Could not connect ZMQ SUB socket %s, cannot start "
++				"Routing Plane interface",
++				zmq_sub_endpoint.c_str());
++	}
++
++	zmq_dealer_socket = zsock_new_dealer(zmq_dealer_endpoint.c_str());
++	if (!zmq_dealer_socket) {
++		THROWEXCEPTION("Could not connect ZMQ DEALER socket %s, cannot start "
++				"Routing Plane interface",
++				zmq_dealer_endpoint.c_str());
++	}
++
++	zsock_set_sndhwm(zmq_sub_socket, zmq_high_watermark);
++	zsock_set_rcvhwm(zmq_sub_socket, zmq_high_watermark);
++	zsock_set_sndhwm(zmq_dealer_socket, zmq_high_watermark);
++	zsock_set_rcvhwm(zmq_dealer_socket, zmq_high_watermark);
++
++	// discard buffered messages when socket is destroyed
++	zsock_set_linger(zmq_dealer_socket, 0);
++
++	if (0 != zpoller_add(zpoller, zmq_sub_socket)) {
++		THROWEXCEPTION("Could not add %s ZMQ socket to ZMQ poller",
++				zmq_sub_endpoint.c_str());
++	}
++
++	msg(LOG_NOTICE, "RoutingPlane listening on %s", zmq_sub_endpoint.c_str());
++	msg(LOG_NOTICE, "RoutingPlane connected to %s", zmq_dealer_endpoint.c_str());
++}
++
++void
++RoutingPlane::tearDownHelper ()
++{
++	zpoller_destroy(&zpoller);
++	zsock_destroy(&zmq_sub_socket);
++	zsock_destroy(&zmq_dealer_socket);
++
++	msg(LOG_NOTICE, "Routing Plane ZMQ poller and sockets destroyed");
++}
++
++RoutingPlane::RoutingPlane(std::string zmq_sub_endpoint,
++		std::string zmq_dealer_endpoint, int zmq_high_watermark,
++		int zmq_poll_timeout)
++: zmq_sub_endpoint(zmq_sub_endpoint),
++  zmq_dealer_endpoint(zmq_dealer_endpoint),
++  zmq_high_watermark(zmq_high_watermark), zmq_poll_timeout(zmq_poll_timeout)
++{
++	if (zmq_sub_endpoint.empty() || zmq_dealer_endpoint.empty()) {
++		THROWEXCEPTION("Need DEALER and SUB endpoints, cannot start "
++				"Routing Plane interface");
++	}
++
++	// Stop CZMQ from hijacking signal handling
++	zsys_handler_set(NULL);
++
++	setUpHelper();
++}
++
++RoutingPlane::~RoutingPlane()
++{
++	tearDownHelper();
++}
++
++void
++RoutingPlane::reconfigure(std::string zmq_dealer_endpoint,
++		std::string zmq_sub_endpoint, int zmq_high_watermark,
++		int zmq_poll_timeout)
++{
++	if (zmq_dealer_endpoint.empty() || zmq_sub_endpoint.empty()) {
++		THROWEXCEPTION("Need DEALER and SUB endpoints, cannot start "
++				"Routing Plane interface");
++	}
++
++	if (this->zmq_poll_timeout != zmq_poll_timeout) {
++		this->zmq_poll_timeout = zmq_poll_timeout;
++	}
++
++	if (this->zmq_high_watermark != zmq_high_watermark) {
++		this->zmq_high_watermark = zmq_high_watermark;
++
++		zsock_set_sndhwm(zmq_sub_socket, zmq_high_watermark);
++		zsock_set_rcvhwm(zmq_sub_socket, zmq_high_watermark);
++		zsock_set_sndhwm(zmq_dealer_socket, zmq_high_watermark);
++		zsock_set_rcvhwm(zmq_dealer_socket, zmq_high_watermark);
++	}
++
++	if (this->zmq_dealer_endpoint != zmq_dealer_endpoint ||
++			this->zmq_sub_endpoint != zmq_sub_endpoint) {
++		tearDownHelper();
++		setUpHelper();
++	}
++}
++
++void
++RoutingPlane::routing_plane_cleanup_data_t (routing_plane_data_t *routing_data)
++{
++	if (routing_data) {
++		msg(LOG_INFO, "Routing Plane API: freeing routing_data buffers");
++
++		if (routing_data->vrf_name_length) {
++			free(routing_data->vrf_name);
++			routing_data->vrf_name = NULL;
++			routing_data->vrf_name_length = 0;
++		}
++
++		if (routing_data->bgp_next_hop_count) {
++			free(routing_data->bgp_next_hops);
++			routing_data->bgp_next_hops = NULL;
++			routing_data->bgp_next_hop_count = 0;
++		}
++
++		if (routing_data->ip_next_hop_count) {
++			free(routing_data->ip_next_hops);
++			routing_data->ip_next_hops = NULL;
++			routing_data->ip_next_hop_count = 0;
++		}
++	}
++}
++
++static inline bool
++parse_ip_address (bool *parsed_ip, uint16_t ip_length,
++		routing_plane_data_t *routing_data, uint8_t *data)
++{
++	char debug_buffer[40];
++
++	/*
++	 * We expect _exactly_ one IP, otherwise we can't match the data to
++	 * the address it refers to. If a frame has multiple IPs, raise an
++	 * error so that the frame gets discarded.
++	 */
++	if (BOOST_UNLIKELY(*parsed_ip)) {
++		return false;
++	}
++
++	memcpy(&routing_data->ip_address, data, ip_length);
++
++	*parsed_ip = true;
++
++	inet_ntop(routing_data->family, &routing_data->ip_address, debug_buffer,
++			40);
++	msg(LOG_INFO, "Routing Plane API: parsing response: IP %s", debug_buffer);
++
++	return true;
++}
++
++static inline bool
++parse_vrf_name (uint16_t data_length, routing_plane_data_t *routing_data,
++		uint8_t *data)
++{
++	routing_data->vrf_name_length = data_length;
++	routing_data->vrf_name = (char*)malloc(data_length + 1);
++	if (BOOST_UNLIKELY(!routing_data->vrf_name)) {
++		return false;
++	}
++
++	/*
++	 * As per protocol definition, vrf_name will NOT be NULL-terminated
++	 * and I _really_ don't like that, so we shove in a \0 at the end.
++	 */
++	memcpy(routing_data->vrf_name, data, data_length);
++	routing_data->vrf_name[data_length] = '\0';
++
++	msg(LOG_INFO, "Routing Plane API: parsing response: VRF %s",
++			routing_data->vrf_name);
++
++	return true;
++}
++
++static inline bool
++parse_ip_nexthop (uint16_t data_length, uint16_t ip_length,
++		routing_plane_data_t *routing_data, uint8_t *data)
++{
++	uint16_t j;
++
++	if (routing_data->family == AF_INET) {
++		routing_data->ip_next_hop_count = data_length / sizeof(struct in_addr);
++	} else {
++		routing_data->ip_next_hop_count = data_length / sizeof(struct in6_addr);
++	}
++
++	routing_data->ip_next_hops = (ip46*)malloc(sizeof (ip46) *
++			routing_data->ip_next_hop_count);
++	if (BOOST_UNLIKELY(!routing_data->ip_next_hops)) {
++		return false;
++	}
++
++	for (j = 0; j < routing_data->ip_next_hop_count; ++j) {
++		memcpy(&routing_data->ip_next_hops[j], data + j * ip_length,
++				ip_length);
++	}
++
++	msg(LOG_INFO, "Routing Plane API: parsing response: %u IP next hop parsed",
++			routing_data->ip_next_hop_count);
++
++	return true;
++}
++
++static inline bool
++parse_bgp_nexthop (uint16_t data_length, uint16_t ip_length,
++		routing_plane_data_t* routing_data, uint8_t *data)
++{
++	uint16_t j;
++
++	if (routing_data->family == AF_INET) {
++		routing_data->bgp_next_hop_count = data_length / sizeof(struct in_addr);
++	} else {
++		routing_data->bgp_next_hop_count = data_length /
++				sizeof(struct in6_addr);
++	}
++
++	routing_data->bgp_next_hops = (ip46*)malloc(sizeof (ip46) *
++			routing_data->bgp_next_hop_count);
++	if (BOOST_UNLIKELY(!routing_data->bgp_next_hops)) {
++		return false;
++	}
++
++	for (j = 0;j < routing_data->bgp_next_hop_count;++j) {
++		memcpy(&routing_data->bgp_next_hops[j], data + j * ip_length,
++				ip_length);
++	}
++
++	msg(LOG_INFO, "Routing Plane API: parsing response: %u BGP next hop "
++			"parsed", routing_data->bgp_next_hop_count);
++
++	return true;
++}
++
++/**
++ * Parses data block from a Routing Plane message.
++ *
++ * @param[in,out]  routing_data  pointers to routing_plane_data_t to be filled
++ *
++ * @param[in]      data   pointer to byte array, data block from Routing Plane
++ *
++ * @param[in]      payload_length  total length of data, for sanity check
++ *
++ * @return         int, number of bytes read, negative on error
++ */
++static int
++parse_data (routing_plane_data_t *routing_data, uint8_t *data,
++		size_t payload_length)
++{
++	size_t ret;
++	uint16_t data_length, data_type, ip_length = routing_data->family ==
++			AF_INET ? sizeof(struct in_addr) : sizeof(struct in6_addr);
++	/*
++	 * We need at the very least an IP address. A frame might contain a lot of
++	 * data, but no address, and we have to discard it if that's the case.
++	 */
++	bool parsed_ip = false;
++
++	/*
++	 * Iterate over all the data relative to one IP address.
++	 */
++	for (ret = 0; ret + NF_DATA_HEADER_LENGTH <= payload_length;
++			ret += NF_DATA_HEADER_LENGTH + data_length, data += data_length) {
++		data_type = NF_MSG_GET_DATA_TYPE(data);
++		data_length = NF_MSG_GET_DATA_LENGTH(data);
++
++		/*
++		 * payload_length is set by ZMQ, so we give it a higher level of trust.
++		 * Routing Plane might be communicating corrupted or wrong data in the
++		 * header length field.
++		 */
++		if (BOOST_UNLIKELY(ret + NF_DATA_HEADER_LENGTH + data_length >
++				   payload_length)) {
++			ret = ROUTING_PLANE_ERROR_INVALID_REP_SIZE;
++			goto error;
++		}
++
++		data += NF_DATA_HEADER_LENGTH;
++
++		switch (data_type) {
++		case NF_DATA_TYPE_IP_ADDRESS:
++			if (BOOST_UNLIKELY(data_length < ip_length)) {
++				break;
++			}
++			if (BOOST_UNLIKELY(!parse_ip_address(&parsed_ip, ip_length,
++					routing_data,
++					data))) {
++				goto error;
++			}
++			break;
++		case NF_DATA_TYPE_PBR_TABLE_ID:
++			routing_data->pbr_table_id = *data;
++
++			msg(LOG_INFO, "Routing Plane API: parsing response: PBR ID %u",
++					routing_data->pbr_table_id);
++
++			break;
++		case NF_DATA_TYPE_VRF_NAME:
++			if (BOOST_UNLIKELY(data_length < 1)) {
++				break;
++			}
++			if (BOOST_UNLIKELY(!parse_vrf_name(data_length, routing_data,
++					data))) {
++				goto error;
++			}
++			break;
++		case NF_DATA_TYPE_VRF_ID:
++			if (BOOST_UNLIKELY(data_length < sizeof(uint32_t))) {
++				break;
++			}
++			routing_data->vrf_id = *(uint32_t *)data;
++
++			msg(LOG_INFO, "Routing Plane API: parsing response: VRF ID %u",
++					ntohl(routing_data->vrf_id));
++
++			break;
++		case NF_DATA_TYPE_HOST_ASN:
++			if (BOOST_UNLIKELY(data_length < sizeof(uint32_t))) {
++				break;
++			}
++			routing_data->host_asn = *(uint32_t *)data;
++
++			msg(LOG_INFO, "Routing Plane API: parsing response: host ASN %u",
++					ntohl(routing_data->host_asn));
++
++			break;
++		case NF_DATA_TYPE_BGP_ADJACENT_ASN:
++			if (BOOST_UNLIKELY(data_length < sizeof(uint32_t))) {
++				break;
++			}
++			routing_data->adj_asn = *(uint32_t *)data;
++
++			msg(LOG_INFO, "Routing Plane API: parsing response: BGP adjacent "
++					"ASN %u", ntohl(routing_data->adj_asn));
++
++			break;
++		case NF_DATA_TYPE_SUBNET_MASK:
++			routing_data->prefix_length = *data;
++
++			msg(LOG_INFO, "Routing Plane API: parsing response: prefix length "
++					"%u", routing_data->prefix_length);
++
++			break;
++		case NF_DATA_TYPE_IP_NHOP_ADDRESSES:
++			if (BOOST_UNLIKELY(data_length < ip_length)) {
++				break;
++			}
++			if (BOOST_UNLIKELY(!parse_ip_nexthop(data_length, ip_length,
++					routing_data, data))) {
++				goto error;
++			}
++			break;
++		case NF_DATA_TYPE_BGP_NHOP_ADDRESSES:
++			if (BOOST_UNLIKELY(data_length < ip_length)) {
++				break;
++			}
++			if (BOOST_UNLIKELY(!parse_bgp_nexthop(data_length, ip_length,
++					routing_data, data))) {
++				goto error;
++			}
++			break;
++		case NF_DATA_TYPE_REQUIRED_INFO:
++			msg(LOG_NOTICE, "Routing Plane API: non-fatal error parsing frame "
++					"from Routing Plane: received NF_DATA_TYPE_REQUIRED_INFO "
++					"frame");
++			break;
++		default:
++			msg(LOG_NOTICE, "Routing Plane API: non-fatal error parsing frame "
++					"from Routing Plane: received unknown %u frame", data_type);
++			break;
++		}
++	}
++
++	/*
++	 * A frame might have a lot of data, but no address, in which case we must
++	 * discard the frame.
++	 */
++	if (BOOST_UNLIKELY(!parsed_ip)) {
++		ret = ROUTING_PLANE_ERROR_REPLY_NO_IP;
++		goto error;
++	}
++
++	return ret;
++
++error:
++RoutingPlane::routing_plane_cleanup_data_t(routing_data);
++	memset(routing_data, 0, sizeof(routing_plane_data_t));
++
++	return ret;
++}
++
++/**
++ * Parses frame from Routing Plane message. This function will try hard to fill
++ * data in routing_data only if it appears to be correct
++ *
++ * @param[in,out]  routing_data  pointer, content will be overwritten
++ *
++ * @param[in]      reply         byte array, message from Routing Plane
++ *
++ * @param[in]      reply_size    size of reply from Routing Plane
++ *
++ * @param[in,out]  msg_type      ptr to uint, will be filled with message type:
++ *          NF_ROUTE_REQUEST, NF_ROUTE_RESPONSENF_ROUTE_WITHDRAW, undef on error
++ *
++ * @return         int, total bytes parsed or negative on error
++ */
++static int
++parse_frame (routing_plane_data_t *routing_data, uint8_t *reply,
++		size_t reply_size, unsigned int *msg_type)
++{
++	size_t payload_length, ip_length;
++	int ret;
++	sa_family_t family;
++
++	msg(LOG_INFO, "Routing Plane API: parsing response: ZMQ frame size %zu "
++			"bytes", reply_size);
++
++	/*
++	 * If we don't get a least a header, something went very wrong.
++	 */
++	if (BOOST_UNLIKELY(!reply || reply_size < NF_MSG_HEADER_LENGTH)) {
++		return ROUTING_PLANE_ERROR_EMPTY_REPLY;
++	}
++
++	/*
++	 * Accept every valid type, leave up to the caller to make sure it's what it
++	 * is expecting.
++	 */
++	*msg_type = NF_MSG_GET_HEADER_TYPE(reply);
++	if (BOOST_UNLIKELY(*msg_type != NF_ROUTE_REQUEST &&
++			*msg_type != NF_ROUTE_RESPONSE && *msg_type != NF_ROUTE_WITHDRAW)) {
++		return ROUTING_PLANE_ERROR_INVALID_REP_TYPE;
++	}
++
++	family = NF_MSG_GET_HEADER_AF(reply);
++	msg(LOG_INFO, "Routing Plane API: parsing response: AF family %u", family);
++	if (family != AF_INET && family != AF_INET6) {
++		return ROUTING_PLANE_ERROR_UNKNOWN_AF;
++	}
++	ip_length = family == AF_INET ?
++			sizeof(struct in_addr) : sizeof(struct in6_addr);
++
++	/*
++	 * The length field of the header does NOT include the length of the header
++	 * We need at the very least one IP address in a response to proceed.
++	 */
++	payload_length = NF_MSG_GET_HEADER_LENGTH(reply);
++	msg(LOG_INFO, "Routing Plane API: parsing response: payload length %zu",
++			payload_length);
++	if (BOOST_UNLIKELY(payload_length < NF_DATA_HEADER_LENGTH + ip_length)) {
++		return ROUTING_PLANE_ERROR_REPLY_NO_IP;
++	}
++
++	/*
++	 * The message header might lie if something goes wrong, so make sure that
++	 * the frame was at least as big as the header claims it to be.
++	 */
++	if (BOOST_UNLIKELY(reply_size < payload_length + NF_MSG_HEADER_LENGTH)) {
++		return ROUTING_PLANE_ERROR_INVALID_REP_SIZE;
++	}
++
++	/*
++	 * We start inspecting the array at the next byte after the header, where
++	 * we expect to find a data header.
++	 */
++	reply += NF_MSG_HEADER_LENGTH;
++
++	/*
++	 * We can extract AF_FAMILY from the header. If we got this far it means
++	 * that there will be (some sort of) data in the payload, so we start to
++	 * fill data into routing_data.
++	 */
++	routing_data->family = family;
++
++	/*
++	 * parse_data will return the total bytes parsed. The only time it
++	 * returns an error is if either a malloc failed, or there was a data
++	 * header without payload, which means Routing Plane told us it would send
++	 * something but it didn't, or the payload was shorter than the header said
++	 * it would be, or there was no IP or multiple IPs.
++	 * In any cases, return an error so that it is logged.
++	 * Also return -1 if the reply had more data than we parsed (which means
++	 * the header lied and the frame was longer than expected).
++	 */
++	ret = parse_data(routing_data, reply, payload_length);
++	if (BOOST_LIKELY(ret >= 0)) {
++		if (BOOST_UNLIKELY((size_t)ret != payload_length ||
++				(size_t)ret + NF_MSG_HEADER_LENGTH < reply_size)) {
++			ret = ROUTING_PLANE_ERROR_INVALID_REP_SIZE;
++		} else {
++			/*
++			 * Add the header length to return the total number of bytes parsed
++			 * from the frame.
++			 */
++			ret += NF_MSG_HEADER_LENGTH;
++		}
++	}
++
++	return ret;
++}
++
++/**
++ * Allocates a message for Routing Plane based on data contained in routing_data
++ *
++ * @param[in]      request_type  16 bits mask of NF_DATA_TYPE_*
++ *
++ * @param[in]      routing_data  pointer to routing_plane_data_t
++ *
++ * @param[in,out]  msg           pointer to pointer to buffer, will be allocated
++ *
++ * @param[in,out]  msg_size      pointer to size of buffer, will be filled
++ *
++ * @return         int, 0 on success or negative on error.
++ */
++static int
++create_request (uint16_t request_type, routing_plane_data_t *routing_data,
++		uint8_t buffer[], size_t *buffer_size)
++{
++	char debug_buffer[40];
++	size_t offset = 0;
++	uint16_t ip_length;
++
++	if (BOOST_UNLIKELY(!routing_data || !buffer || !buffer_size)) {
++		return ROUTING_PLANE_ERROR_INPUT;
++	}
++
++	/*
++	 * Figure out how large a buffer we need. PBR ID and VRF name are optional,
++	 * so the buffer has to be allocated at runtime and cannot be on the stack.
++	 */
++	if (BOOST_LIKELY(routing_data->family == AF_INET)) {
++		*buffer_size = NF_REQUEST_SIZE_V4;
++	} else if (BOOST_LIKELY(routing_data->family == AF_INET6)) {
++		*buffer_size = NF_REQUEST_SIZE_V6;
++	} else {
++		return ROUTING_PLANE_ERROR_UNKNOWN_AF;
++	}
++	msg(LOG_INFO, "Routing Plane API: parsing request: AF family %u",
++			routing_data->family);
++
++	if (routing_data->pbr_table_id) {
++		*buffer_size += NF_DATA_HEADER_LENGTH + NF_PBR_TABLE_ID_LENGTH;
++	}
++
++	if (routing_data->vrf_name_length) {
++		*buffer_size += NF_DATA_HEADER_LENGTH + routing_data->vrf_name_length;
++	}
++
++	if (routing_data->vrf_id) {
++		*buffer_size += NF_DATA_HEADER_LENGTH + NF_VRF_ID_LENGTH;
++	}
++
++	msg(LOG_INFO, "Routing Plane API: parsing request: payload length %zu",
++			*buffer_size - NF_MSG_HEADER_LENGTH);
++
++	/*
++	 * Set the header values. As per the protocol, the header comes first in
++	 * each frame, with type, AF_FAMILY and payload size.
++	 */
++	NF_MSG_SET_HEADER_TYPE(buffer + offset, NF_ROUTE_REQUEST);
++	NF_MSG_SET_HEADER_AF(buffer + offset, routing_data->family);
++	NF_MSG_SET_HEADER_LENGTH(buffer + offset,
++			*buffer_size - NF_MSG_HEADER_LENGTH);
++
++	/*
++	 * Bump the pointer to the first data header and as per protocol definition
++	 * add length of data body and type, which for the request type is first of
++	 * all the definition of what we are asking for.
++	 */
++	offset += NF_MSG_HEADER_LENGTH;
++	NF_MSG_SET_DATA_TYPE(buffer + offset, NF_DATA_TYPE_REQUIRED_INFO);
++	NF_MSG_SET_DATA_LENGTH(buffer + offset, NF_REQ_DATA_LENGTH);
++
++	/*
++	 * Info is the request type, which is a 16 bits mask, bitwise OR of
++	 * possible values. See RoutingPlane.hpp for details about the values and
++	 * various #defines. It will tell Routing Plane what we want to know about
++	 * the IP address we include in the next section of the frame.
++	 */
++	offset += NF_DATA_HEADER_LENGTH;
++	NF_MSG_SET_REQ_INFO(buffer + offset, request_type);
++
++
++	offset += NF_REQ_DATA_LENGTH;
++	ip_length = routing_data->family == AF_INET ?
++			sizeof(struct in_addr) : sizeof(struct in6_addr);
++	NF_MSG_SET_DATA_TYPE(buffer + offset, NF_DATA_TYPE_IP_ADDRESS);
++	NF_MSG_SET_DATA_LENGTH(buffer + offset, ip_length);
++
++	offset += NF_DATA_HEADER_LENGTH;
++	memcpy(buffer + offset, &routing_data->ip_address, ip_length);
++	offset += ip_length;
++
++	inet_ntop(routing_data->family, &routing_data->ip_address, debug_buffer,
++			40);
++	msg(LOG_INFO, "Routing Plane API: parsing request: IP %s", debug_buffer);
++
++
++	if (routing_data->pbr_table_id) {
++		NF_MSG_SET_DATA_TYPE(buffer + offset, NF_DATA_TYPE_PBR_TABLE_ID);
++		NF_MSG_SET_DATA_LENGTH(buffer + offset, NF_PBR_TABLE_ID_LENGTH);
++		offset += NF_DATA_HEADER_LENGTH;
++		memcpy(buffer + offset, &routing_data->pbr_table_id,
++				NF_PBR_TABLE_ID_LENGTH);
++		msg(LOG_INFO, "Routing Plane API: parsing request: PBR ID %u",
++				routing_data->pbr_table_id);
++		offset += NF_PBR_TABLE_ID_LENGTH;
++	}
++
++	if (routing_data->vrf_name_length) {
++		NF_MSG_SET_DATA_TYPE(buffer + offset, NF_DATA_TYPE_VRF_NAME);
++		NF_MSG_SET_DATA_LENGTH(buffer + offset,
++				routing_data->vrf_name_length);
++		offset += NF_DATA_HEADER_LENGTH;
++		memcpy(buffer + offset, routing_data->vrf_name,
++				routing_data->vrf_name_length);
++		msg(LOG_INFO, "Routing Plane API: parsing request: VRF %s",
++				routing_data->vrf_name);
++		offset += routing_data->vrf_name_length;
++	}
++
++	if (routing_data->vrf_id) {
++		NF_MSG_SET_DATA_TYPE(buffer + offset, NF_DATA_TYPE_VRF_ID);
++		NF_MSG_SET_DATA_LENGTH(buffer + offset, NF_VRF_ID_LENGTH);
++		offset += NF_DATA_HEADER_LENGTH;
++		memcpy(buffer + offset, &routing_data->vrf_id,
++				NF_VRF_ID_LENGTH);
++		msg(LOG_INFO, "Routing Plane API: parsing request: VRF ID %u",
++				ntohl(routing_data->vrf_id));
++		offset += NF_VRF_ID_LENGTH;
++	}
++
++	return 0;
++}
++
++int
++RoutingPlane::get_data (routing_plane_data_t *routing_data[],
++		size_t req_count, uint16_t flags)
++{
++	uint8_t request_buffer[NF_REQUEST_BUFFER_MAX_SIZE];
++	zmsg_t *msg_request = NULL, *msg_reply = NULL;
++	zframe_t *frame_reply;
++	size_t i, num_frames, good_frames = 0, request_size = 0;
++	int ret = 0;
++
++	errno = 0;
++
++	if (!req_count) {
++		return 0;
++	}
++
++	if (!routing_data || req_count == 0) {
++		ret = ROUTING_PLANE_ERROR_INVALID_ARGUMENT;
++		goto error;
++	}
++
++	if (!flags) {
++		flags = NF_DATA_TYPE_ALL_FIELDS;
++	} else if ((flags | NF_DATA_TYPE_ALL_FIELDS) != NF_DATA_TYPE_ALL_FIELDS) {
++		ret = ROUTING_PLANE_ERROR_INVALID_FLAGS;
++		goto error;
++	}
++
++	msg_request = zmsg_new();
++	if (!msg_request) {
++		ret = ROUTING_PLANE_ERROR_ZMQ_API;
++		goto error;
++	}
++
++	msg(LOG_INFO, "Routing Plane API: processing %zu requests for data, with "
++			"flags %u", req_count, flags);
++
++	/*
++	 * Add empty frame. We are using ZMQ_DEALER, which unlike ZMQ_REQ does not
++	 * add it for us.
++	 */
++	frame_reply = zframe_new_empty();
++	if (!frame_reply) {
++		ret = ROUTING_PLANE_ERROR_ZMQ_API;
++		goto error;
++	}
++	ret = zmsg_append(msg_request, &frame_reply);
++	if (ret < 0) {
++		ret = ROUTING_PLANE_ERROR_ZMQ_API;
++		goto error;
++	}
++
++	/*
++	 * Parse the input and create a frame for each routing_plane_data_t
++	 * structure (a frame per address), as per protocol definition.
++	 */
++	for (i = 0; i < req_count; ++i) {
++		msg(LOG_INFO, "Routing Plane API: processing request %zu", i);
++
++		ret = create_request(flags, routing_data[i], request_buffer,
++				&request_size);
++		if (BOOST_UNLIKELY(ret < 0)) {
++			goto error;
++		}
++
++		ret = zmsg_addmem(msg_request, request_buffer, request_size);
++		if (BOOST_UNLIKELY(ret < 0)) {
++			ret = ROUTING_PLANE_ERROR_ZMQ_API;
++			goto error;
++		}
++	}
++
++	msg(LOG_INFO, "Routing Plane API: sending %zu frames in one message to "
++			"Routing Plane", req_count);
++
++	ret = zmsg_send(&msg_request, zmq_dealer_socket);
++	if (ret < 0) {
++		ret = ROUTING_PLANE_ERROR_ZMQ_API;
++		goto error;
++	}
++
++	msg(LOG_INFO, "Routing Plane API: blocking on zmsg_recv waiting for "
++			"response from Routing Plane");
++
++	/*
++	 * Note, this is a blocking call.
++	 */
++	msg_reply = zmsg_recv(zmq_dealer_socket);
++	if (!msg_reply) {
++		/*
++		 * Note that even if we could check if recv was interrupted by a signal
++		 * and retry, we don't. This call will likely be blocked for a long
++		 * while, and if we get a signal it means that we either have to close
++		 * the socket to change the recipient, or that the process is either
++		 * restarting or terminating. In any case there's no point in
++		 * stalling and trying to receive again.
++		 */
++		ret = ROUTING_PLANE_ERROR_ZMQ_API;
++		goto error;
++	}
++
++	/*
++	 * We expect at least a frame, even when there is no data available.
++	 * If there are zero frames, something is wrong with the channel and we
++	 * should report it to the caller.
++	 */
++	num_frames = zmsg_size(msg_reply);
++	if (!num_frames) {
++		ret = ROUTING_PLANE_ERROR_EMPTY_REPLY;
++		goto error;
++	}
++
++	msg(LOG_INFO, "Routing Plane API: received response from Routing Plane, "
++			"one msg with %zu frames",
++			num_frames);
++
++	msg(LOG_INFO, "Routing Plane API: resetting input routing_data before "
++			"parsing response");
++
++	/*
++	 * If we got to this point, we got a reply back and it has at least some
++	 * frames, which means some data. So from now on, we _COULD_ return with a
++	 * partial answer, since we are doing a best-effort service. Zero the input
++	 * in order to avoid mismatches of the kind: 2 requests but only one reply
++	 * to the second req, which if we don't zero the struct will mean returning
++	 * the same IP address in both members, one with the actual data and one
++	 * with the expected info zeroe'd.
++	 */
++	for (i = 0; i < req_count; ++i) {
++		routing_plane_cleanup_data_t(routing_data[i]);
++		memset(routing_data[i], 0, sizeof(routing_plane_data_t));
++	}
++
++	/*
++	 * Pop the first empty frame. We are using ZMQ_DEALER, which unlike ZMQ_REQ
++	 * does not remove it for us.
++	 */
++	frame_reply = zmsg_pop(msg_reply);
++	zframe_destroy(&frame_reply);
++	--num_frames;
++
++	/*
++	 * Parse the reply and fill in the routing_plane_data_t structure(s) before
++	 * returning to the caller. As per protocol definition, we expect one frame
++	 * per address request.
++	 */
++	for (i = 0; i < num_frames && i < req_count; ++i) {
++		msg(LOG_INFO, "Routing Plane API: processing request %zu", i);
++
++		frame_reply = zmsg_pop(msg_reply);
++		if (BOOST_UNLIKELY(!frame_reply)) {
++			/*
++			 * This should not happen, since we extracted the count. But it
++			 * does not hurt to check. In case a frame is empty, try and go
++			 * further, as we are limited by num_frames and req_count anyway.
++			 */
++			msg(LOG_NOTICE, "Routing Plane API: non-fatal error parsing frame "
++					"from Routing Plane: received empty frame");
++			continue;
++		}
++
++		unsigned int msg_type;
++		ret = parse_frame(routing_data[i], zframe_data(frame_reply),
++				zframe_size(frame_reply), &msg_type);
++		if (BOOST_UNLIKELY(ret < 0 || msg_type != NF_ROUTE_RESPONSE)) {
++			/*
++			 * If there are problems in a frame, others might be valid, so we
++			 * do not exit immediately. Report and error and try to continue.
++			 */
++			msg(LOG_NOTICE, "Routing Plane API: non-fatal error parsing frame "
++					"from Routing Plane: received malformed frame");
++		} else {
++			/*
++			 * Keep a count of how many good frames the reply had, so that if
++			 * there were none we can report an error.
++			 */
++			++good_frames;
++			msg(LOG_INFO, "Routing Plane API: parsed good frame from "
++					"Routing Plane, %d bytes read", ret);
++		}
++		zframe_destroy(&frame_reply);
++	}
++
++	if (!good_frames) {
++		ret = ROUTING_PLANE_ERROR_EMPTY_REPLY;
++		goto error;
++	}
++
++	msg(LOG_INFO, "Routing Plane API: processed %zu good frames from "
++			"Routing Plane, returning", good_frames);
++
++	ret = 0;
++
++error:
++	if (msg_request) {
++		zmsg_destroy(&msg_request);
++	}
++	if (msg_reply) {
++		zmsg_destroy(&msg_reply);
++	}
++	if (ret < 0) {
++		if (errno) {
++			msg(LOG_CRIT, "Routing Plane API: fatal system error: %s",
++					strerror(errno));
++		}
++		msg(LOG_CRIT, "Routing Plane API: fatal error contacting Routing Plane"
++				" Netflow APIs module error: %s", routing_plane_errors[-ret]);
++	}
++
++	return ret;
++}
++
++int
++RoutingPlane::parse_update_reply (zmsg_t *msg_reply, size_t num_frames)
++{
++	zframe_t *frame_reply;
++	routing_plane_data_t *routing_data;
++	size_t i;
++	int ret = 0, good_frames = 0;
++
++	/*
++	 * Parse the reply and update the cache. As per protocol definition, we
++	 * expect one frame per address update.
++	 */
++	for (i = 0; i < num_frames; ++i) {
++		msg(LOG_INFO, "Routing Plane API: processing update %zu", i);
++
++		frame_reply = zmsg_pop(msg_reply);
++		if (BOOST_UNLIKELY(!frame_reply)) {
++			/*
++			 * This should not happen, since we extracted the count. But it
++			 * does not hurt to check. In case a frame is empty, try and go
++			 * further, as we are limited by num_frames and req_count anyway.
++			 */
++			msg(LOG_NOTICE, "Routing Plane API: non-fatal error parsing frame "
++					"from Routing Plane: received empty frame");
++			continue;
++		}
++
++		routing_data = (routing_plane_data_t *)calloc(1,
++				sizeof(routing_plane_data_t));
++		if (!routing_data) {
++			msg(LOG_CRIT, "Routing Plane API: fatal calloc error: %s",
++					strerror(errno));
++			continue;
++		}
++
++		unsigned int msg_type;
++		ret = parse_frame(routing_data, zframe_data(frame_reply),
++				zframe_size(frame_reply), &msg_type);
++		if (BOOST_UNLIKELY(ret < 0 || (msg_type != NF_ROUTE_RESPONSE &&
++				msg_type != NF_ROUTE_WITHDRAW))) {
++			/*
++			 * If there are problems in a frame, others might be valid, so we
++			 * do not exit immediately. Report and error and try to continue.
++			 */
++			RoutingPlane::routing_plane_cleanup_data_t(routing_data);
++			free(routing_data);
++			msg(LOG_NOTICE, "Routing Plane API: non-fatal error parsing frame "
++					"from Routing Plane: received malformed update frame");
++		} else {
++			msg(LOG_INFO, "Routing Plane API: parsed good update frame from "
++					"Routing Plane, %d bytes, updating Routing Plane cache",
++					ret);
++
++			// TODO: add routing_data to cache!
++			free(routing_data);
++
++			++good_frames;
++		}
++		zframe_destroy(&frame_reply);
++	}
++
++	return good_frames;
++}
++
++int
++RoutingPlane::routing_plane_process_update (zsock_t *sock)
++{
++	zmsg_t *msg_reply = NULL;
++	size_t num_frames;
++	int ret = 0;
++
++	msg(LOG_INFO, "Routing Plane API: reading message from Routing Plane "
++			"PUB-SUB ZMQ socket");
++
++	msg_reply = zmsg_recv(sock);
++	if (!msg_reply) {
++		ret = ROUTING_PLANE_ERROR_ZMQ_API;
++		goto error;
++	}
++
++	/*
++	 * We expect at least a frame, since the message was published on PUB socket
++	 */
++	num_frames = zmsg_size(msg_reply);
++	if (!num_frames) {
++		ret = ROUTING_PLANE_ERROR_EMPTY_REPLY;
++		goto error;
++	}
++
++	msg(LOG_INFO, "Routing Plane API: received update from Routing Plane, one "
++			"msg with %zu frames", num_frames);
++
++	ret = parse_update_reply(msg_reply, num_frames);
++	if (ret <= 0) {
++		ret = ROUTING_PLANE_ERROR_EMPTY_REPLY;
++		goto error;
++	}
++
++	msg(LOG_INFO, "Routing Plane API: processed all frames from Routing Plane "
++			"update, returning");
++
++error:
++	if (msg_reply) {
++		zmsg_destroy(&msg_reply);
++	}
++	if (ret < 0) {
++		if (errno) {
++			msg(LOG_CRIT, "Routing Plane API: fatal system error: %s",
++					strerror(errno));
++		}
++		msg(LOG_CRIT, "Routing Plane API: fatal error receiving update, "
++				"Routing Plane Netflow APIs  module error: %s",
++				routing_plane_errors[-ret]);
++	}
++
++	return ret;
++}
++
++#endif // ZMQ_SUPPORT_ENABLED
+diff --git a/src/modules/ipfix/RoutingPlane.hpp b/src/modules/ipfix/RoutingPlane.hpp
+new file mode 100644
+index 0000000..e9f4531
+--- /dev/null
++++ b/src/modules/ipfix/RoutingPlane.hpp
+@@ -0,0 +1,307 @@
++/*
++ * Routing Plane interface class
++ * Copyright (C) 2015 Brocade Communications Systems
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ */
++
++#ifndef ROUTING_PLANE_H
++#define ROUTING_PLANE_H
++
++#include <stdexcept>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++using namespace std;
++
++/*
++ * Message Definitions for Routing Plane protocol
++ * Message Header
++ * 1                           16                               32
++ * +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++ * |      Message Type         |             Family              |
++ * ---------------------------------------------------------------
++ * |                         Length                              |
++ * ---------------------------------------------------------------
++ * |                                                             |
++ * |                                                             |
++ * |                          Data                               |
++ * |                                                             |
++ * |                                                             |
++ * +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++ *
++ * Message Types
++ * #define NF_ROUTE_REQUEST                 (1 << 0)
++ * #define NF_ROUTE_RESPONSE                (1 << 1)
++ *
++ * Family
++ * AF_INET
++ * AF_INET6
++ *
++ * NF_ROUTE_REQUEST Message
++ * 1                            16                              32
++ * +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++ * |           Data Type         |           Data Length         |
++ * ---------------------------------------------------------------
++ * |                                                             |
++ * |                            Data                             |
++ * |                                                             |
++ * +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++ *
++ *
++ * NF_ROUTE_RESPONSE Message
++ * 1                          16                                 32
++ * ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++ * |      Data Type            |     Data Length                  |
++ * ----------------------------------------------------------------
++ * |                                                              |
++ * |                          Data                                |
++ * |                                                              |
++ * ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++ *
++ * Example:
++ * Request:
++ * NF_ROUTE_REQUEST, AF_INET, 14,
++ * NF_DATA_TYPE_REQUIRED_INFO, 2, (NF_DATA_TYPE_HOST_ASN |
++ *     NF_DATA_TYPE_IP_NHOP_ADDRESSES)
++ * NF_DATA_TYPE_IP_ADDRESS, 4, 1.1.1.1
++ * NF_ROUTE_REQUEST, AF_INET, 14,
++ * NF_DATA_TYPE_REQUIRED_INFO, 2, (NF_DATA_TYPE_HOST_ASN |
++ *     NF_DATA_TYPE_IP_NHOP_ADDRESSES)
++ * NF_DATA_TYPE_IP_ADDRESS, 4, 2.2.2.2
++ *
++ * Response:
++ * NF_ROUTE_RESPONSE, AF_INET, 24,
++ * NF_DATA_TYPE_IP_ADDRESS, 4, 1.1.1.1, NF_DATA_TYPE_HOST_ASN, 4, 10,
++ *     NF_DATA_TYPE_IP_NHOP_ADDRESSES, 4, 10.10.10.10
++ * NF_ROUTE_RESPONSE, AF_INET, 24,
++ * NF_DATA_TYPE_IP_ADDRESS, 4, 2.2.2.2, NF_DATA_TYPE_HOST_ASN, 4, 20,
++ *     NF_DATA_TYPE_IP_NHOP_ADDRESSES, 8, 10.10.10.10, 20.20.20.20
++ */
++
++/*
++ * Message Types
++ */
++#define NF_ROUTE_REQUEST                 1
++#define NF_ROUTE_RESPONSE                2
++#define NF_ROUTE_WITHDRAW                3
++
++/*
++ * Length fields:
++ *  - The Length for the nexthop addresses will be n * length of
++ *     (IPv4 / IPv6 address), where the type of family is determined
++ *     from the Message Header.
++ *  - VRF Name is a string, NOT NULL-terminated
++ *  - PBR Table is of 1 byte length
++ */
++#define NF_MSG_HEADER_LENGTH            8
++#define NF_DATA_HEADER_LENGTH           4
++#define NF_REQ_DATA_LENGTH              2
++#define NF_PBR_TABLE_ID_LENGTH          1
++#define NF_VRF_ID_LENGTH                4
++#define NF_TLV_VRF_NAME_LEN_MAX         255
++
++/*
++ * As per definition in the protocol, a message payload to RIBd
++ * contains: data header, 4 bytes, and an ip address, 4/16 bytes, plus the
++ * request type flag, 2 bytes, and its header, 4 bytes, plus message header, 8
++ * bytes. The optional VRF and PBR id are not included in this macro.
++ */
++#define NF_REQUEST_SIZE_V4          (NF_MSG_HEADER_LENGTH + 2 * \
++	NF_DATA_HEADER_LENGTH + NF_REQ_DATA_LENGTH + sizeof(struct in_addr))
++#define NF_REQUEST_SIZE_V6          (NF_MSG_HEADER_LENGTH + 2 * \
++	NF_DATA_HEADER_LENGTH + NF_REQ_DATA_LENGTH + sizeof(struct in6_addr))
++
++/*
++ * The max possible size of a request buffer, used to be able to stack-allocate
++ * the request buffer and re-use it, in order to be sure to have enough space
++ * for any type of query.
++ */
++#define NF_REQUEST_BUFFER_MAX_SIZE      (NF_REQUEST_SIZE_V6 + \
++	NF_DATA_HEADER_LENGTH + NF_PBR_TABLE_ID_LENGTH + \
++	NF_DATA_HEADER_LENGTH + NF_TLV_VRF_NAME_LEN_MAX + \
++	NF_VRF_ID_LENGTH)
++
++
++/*
++ * Macros to get and set message/data header fields. Will take care of swapping
++ * bytes to/from network order.
++ */
++#define NF_MSG_HEADER_AF_OFFSET         2
++#define NF_MSG_HEADER_LENGTH_OFFSET     4
++#define NF_MSG_DATA_LENGTH_OFFSET       2
++
++#define NF_MSG_GET_HEADER_TYPE(p) (ntohs(*(uint16_t *)((uint8_t *)(p))))
++#define NF_MSG_GET_HEADER_AF(p) \
++	(ntohs(*(sa_family_t *)((uint8_t *)(p) + NF_MSG_HEADER_AF_OFFSET)))
++#define NF_MSG_GET_HEADER_LENGTH(p) \
++	(ntohl(*(uint32_t *)((uint8_t *)(p) + NF_MSG_HEADER_LENGTH_OFFSET)))
++#define NF_MSG_GET_DATA_TYPE(p) (ntohs(*(uint16_t *)((uint8_t *)(p))))
++#define NF_MSG_GET_DATA_LENGTH(p) \
++	(ntohs(*(uint16_t *)((uint8_t *)(p) + NF_MSG_DATA_LENGTH_OFFSET)))
++
++#define NF_MSG_SET_HEADER_TYPE(p,val) \
++	((*(uint16_t *)((uint8_t *)(p))) = htons(val))
++#define NF_MSG_SET_HEADER_AF(p,val) \
++	((*(sa_family_t *)((uint8_t *)(p) + NF_MSG_HEADER_AF_OFFSET)) = htons(val))
++#define NF_MSG_SET_HEADER_LENGTH(p,val) \
++	((*(uint32_t *)((uint8_t *)(p) + NF_MSG_HEADER_LENGTH_OFFSET)) = htonl(val))
++#define NF_MSG_SET_DATA_TYPE(p,val) \
++	((*(uint16_t *)((uint8_t *)(p))) = htons(val))
++#define NF_MSG_SET_DATA_LENGTH(p,val) \
++	((*(uint16_t *)((uint8_t *)(p) + NF_MSG_DATA_LENGTH_OFFSET)) = htons(val))
++#define NF_MSG_SET_REQ_INFO(p,val) \
++	((*(uint16_t *)((uint8_t *)(p))) = htons(val))
++
++/*
++ * Data types defines. get_data takes an OR'ed mask. An ALL_FIELDS define
++ * is provided for convenience.
++ */
++#define NF_DATA_TYPE_IP_ADDRESS               (1 << 0)
++#define NF_DATA_TYPE_PBR_TABLE_ID             (1 << 1)
++#define NF_DATA_TYPE_VRF_NAME                 (1 << 2)
++#define NF_DATA_TYPE_REQUIRED_INFO            (1 << 3)
++#define NF_DATA_TYPE_HOST_ASN                 (1 << 4)
++#define NF_DATA_TYPE_SUBNET_MASK              (1 << 5)
++#define NF_DATA_TYPE_IP_NHOP_ADDRESSES        (1 << 6)
++#define NF_DATA_TYPE_BGP_NHOP_ADDRESSES       (1 << 7)
++#define NF_DATA_TYPE_BGP_ADJACENT_ASN         (1 << 8)
++#define NF_DATA_TYPE_VRF_ID                   (1 << 9)
++#define NF_DATA_TYPE_ALL_FIELDS (NF_DATA_TYPE_HOST_ASN | \
++	NF_DATA_TYPE_SUBNET_MASK | NF_DATA_TYPE_IP_NHOP_ADDRESSES | \
++	NF_DATA_TYPE_BGP_NHOP_ADDRESSES | NF_DATA_TYPE_BGP_ADJACENT_ASN)
++
++/*
++ * Error codes returned by get_data (note: they will be negated).
++ */
++#define ROUTING_PLANE_SUCCESS                  0
++#define ROUTING_PLANE_ERROR_GENERAL           -1
++#define ROUTING_PLANE_ERROR_ZMQ_API           -2
++#define ROUTING_PLANE_ERROR_INPUT             -3
++#define ROUTING_PLANE_INFO_TIMEOUT            -4
++#define ROUTING_PLANE_INFO_INTERRUPTED        -5
++#define ROUTING_PLANE_MISMATCHING_AF          -6
++#define ROUTING_PLANE_ERROR_EMPTY_REPLY       -7
++#define ROUTING_PLANE_ERROR_UNKNOWN_AF        -8
++#define ROUTING_PLANE_ERROR_INVALID_ARGUMENT  -9
++#define ROUTING_PLANE_ERROR_INVALID_REP_TYPE  -10
++#define ROUTING_PLANE_ERROR_INVALID_REP_SIZE  -11
++#define ROUTING_PLANE_ERROR_REPLY_NO_IP       -12
++#define ROUTING_PLANE_ERROR_REPLY_MULTIPLE_IP -13
++#define ROUTING_PLANE_ERROR_INVALID_FLAGS     -14
++
++// default poll timeout, 1 second
++#define RP_ZMQ_POLL_TIMEOUT_DEFAULT 1000
++
++/*
++ * 16 bytes union, useful since a request can be either AF_INET or AF_INET6.
++ */
++typedef union {
++	struct in_addr addr;
++	struct in6_addr addr6;
++} ip46;
++
++/*
++ * family and ip_address are the parameters used to ask for data, so they have
++ * to be filled by the caller. RIBd as part of the response returns the input
++ * too, the API will overwrite them. NOTE: ip_next_hops, bgp_next_hops and
++ * vrf_name have to be allocated at runtime, since the length is not known
++ * before the response. The user of the API has to call
++ * routing_plane_cleanup_data_t in order to free them.
++ */
++typedef struct {
++	ip46 ip_address;
++	ip46 *ip_next_hops;
++	ip46 *bgp_next_hops;
++	char *vrf_name;
++	uint32_t host_asn;
++	uint32_t adj_asn;
++	uint32_t vrf_id;
++	sa_family_t family;
++	uint16_t ip_next_hop_count;
++	uint16_t bgp_next_hop_count;
++	uint16_t vrf_name_length;
++	uint8_t pbr_table_id;
++	uint8_t prefix_length;
++} routing_plane_data_t;
++
++
++#ifdef ZMQ_SUPPORT_ENABLED
++
++#include <czmq.h>
++
++
++class RoutingPlane
++{
++public:
++	RoutingPlane(std::string zmq_sub_endpoint = std::string(),
++			std::string zmq_dealer_endpoint = std::string(),
++			int zmq_high_watermark = 0,
++			int zmq_poll_timeout = RP_ZMQ_POLL_TIMEOUT_DEFAULT);
++	virtual ~RoutingPlane();
++	void reconfigure(std::string zmq_sub_endpoint,
++			std::string zmq_dealer_endpoint, int zmq_high_watermark,
++			int zmq_poll_timeout);
++	int get_data(routing_plane_data_t *routing_data[], size_t req_count,
++			uint16_t flags);
++	static void routing_plane_cleanup_data_t(routing_plane_data_t *routing_data);
++
++protected:
++	std::string zmq_sub_endpoint;
++	std::string zmq_dealer_endpoint;
++	int zmq_high_watermark;
++	int zmq_poll_timeout;
++
++private:
++	int parse_update_reply(zmsg_t *msg_reply, size_t num_frames);
++	int routing_plane_process_update(zsock_t *sock);
++	void setUpHelper();
++	void tearDownHelper();
++
++	zsock_t *zmq_dealer_socket;
++	zsock_t *zmq_sub_socket;
++	zpoller_t *zpoller;
++};
++
++#else // ZMQ_SUPPORT_ENABLED
++
++class RoutingPlane
++{
++public:
++	RoutingPlane(std::string zmq_sub_endpoint = std::string(),
++			std::string zmq_dealer_endpoint = std::string(),
++			int zmq_high_watermark = 0,
++			int zmq_poll_timeout = RP_ZMQ_POLL_TIMEOUT_DEFAULT) {
++		THROWEXCEPTION("ZMQ not supported!");
++	}
++	void reconfigure(std::string zmq_sub_endpoint,
++			std::string zmq_dealer_endpoint, int zmq_high_watermark,
++			int zmq_poll_timeout) {
++		THROWEXCEPTION("ZMQ not supported!");
++	}
++	int get_data(routing_plane_data_t *routing_data[], size_t req_count,
++			uint16_t flags) {
++		THROWEXCEPTION("ZMQ not supported!");
++	}
++	static void routing_plane_cleanup_data_t(routing_plane_data_t *routing_data) {
++		THROWEXCEPTION("ZMQ not supported!");
++	}
++};
++
++#endif // ZMQ_SUPPORT_ENABLED
++
++#endif // ROUTING_PLANE_H
