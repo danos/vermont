@@ -1,0 +1,111 @@
+From: Nicholas Brown <nick.brown@att.com>
+Date: Wed, 18 Dec 2019 13:24:22 +0000
+Subject: Add a logging attribute to the ipfix config element
+
+This allows the logging level to set as part of configuration, instead
+of having to use the `-l` CLI option. This mean it can also be changed
+dynamically when the config file is re-read for changes.
+---
+ src/common/msg.cc             | 25 +++++++++++++++++++++++++
+ src/common/msg.h              |  1 +
+ src/modules/ConfigManager.cpp |  5 +++++
+ src/vermont.cc                | 22 ----------------------
+ 4 files changed, 31 insertions(+), 22 deletions(-)
+
+diff --git a/src/common/msg.cc b/src/common/msg.cc
+index b3e5032..7779979 100644
+--- a/src/common/msg.cc
++++ b/src/common/msg.cc
+@@ -66,6 +66,31 @@ extern "C" {
+ 		}
+ 	}
+ 
++	/**
++	* parse a string and return a logging bitmask
++	*/
++	int
++	parse_log_level (const char *arg)
++	{
++		int mask = msg_getlevel();
++
++		if (!strcmp("debug", arg)) {
++			mask = LOG_UPTO(LOG_DEBUG);
++		} else if (!strcmp("info", arg)) {
++			mask = LOG_UPTO(LOG_INFO);
++		} else if (!strcmp("notice", arg)) {
++			mask = LOG_UPTO(LOG_NOTICE);
++		} else if (!strcmp("warning", arg)) {
++			mask = LOG_UPTO(LOG_WARNING);
++		} else if (!strcmp("err", arg)) {
++			mask = LOG_UPTO(LOG_ERR);
++		} else if (!strcmp("crit", arg)) {
++			mask = LOG_UPTO(LOG_CRIT);
++		}
++
++		return mask;
++	}
++
+ 	/**
+ 	 * initializes logging system
+ 	 * must be called at program startup!
+diff --git a/src/common/msg.h b/src/common/msg.h
+index 8133ce4..683612e 100644
+--- a/src/common/msg.h
++++ b/src/common/msg.h
+@@ -43,6 +43,7 @@ typedef void (*LOGFUNCTION)(void *);
+ void msg_init(void);
+ void msg_shutdown(void);
+ void msg2(const int, const char*, const char*, const char*, const int, const char *, ...);
++int parse_log_level (const char *arg);
+ void msg_setlevel(int);
+ int msg_getlevel();
+ void msg_setquiet(bool);
+diff --git a/src/modules/ConfigManager.cpp b/src/modules/ConfigManager.cpp
+index 8d8d3df..9c69bdf 100644
+--- a/src/modules/ConfigManager.cpp
++++ b/src/modules/ConfigManager.cpp
+@@ -154,6 +154,11 @@ void ConfigManager::parseConfig(std::string fileName)
+ 			       " This is not a valid configuration file!");
+ 	}
+ 
++	XMLAttribute* logging_attribute = root->getAttribute("logging");
++	if (logging_attribute) {
++		msg_setlevel(parse_log_level(logging_attribute->getValue().c_str()));
++	}
++
+ 	/* process each root element node and add a new node (with its config
+ 	 * attached to the node) to the graph
+ 	 */
+diff --git a/src/vermont.cc b/src/vermont.cc
+index e716600..0f2ac5b 100644
+--- a/src/vermont.cc
++++ b/src/vermont.cc
+@@ -127,28 +127,6 @@ daemonise (const char *pid_file, uid_t uid, gid_t gid)
+ 	}
+ }
+ 
+-static int
+-parse_log_level (const char *arg)
+-{
+-	int mask = msg_getlevel();
+-
+-	if (!strcmp("debug", arg)) {
+-		mask = LOG_UPTO(LOG_DEBUG);
+-	} else if (!strcmp("info", arg)) {
+-		mask = LOG_UPTO(LOG_INFO);
+-	} else if (!strcmp("notice", arg)) {
+-		mask = LOG_UPTO(LOG_NOTICE);
+-	} else if (!strcmp("warning", arg)) {
+-		mask = LOG_UPTO(LOG_WARNING);
+-	} else if (!strcmp("error", arg)) {
+-		mask = LOG_UPTO(LOG_ERR);
+-	} else if (!strcmp("critical", arg)) {
+-		mask = LOG_UPTO(LOG_CRIT);
+-	}
+-
+-	return mask;
+-}
+-
+ static void
+ usage (int status)
+ {
