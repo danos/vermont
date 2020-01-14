@@ -2,8 +2,7 @@ Source: vermont
 Section: contrib/net
 Priority: optional
 Maintainer: Vyatta Support <DL-vyatta-help@att.com>
-Build-Depends: debhelper (>= 9),
- dh-systemd,
+Build-Depends: debhelper (>= 9.20160709),
  cmake,
  pkg-config,
  libboost-dev,
@@ -41,7 +40,7 @@ Description: VERsatile MONitoring Toolkit for processing network flow data
 Package: vermont-dbg
 Architecture: any
 Section: contrib/debug
-Priority: extra
+Priority: optional
 Depends:
  vermont (= ${binary:Version}),
  ${misc:Depends}
