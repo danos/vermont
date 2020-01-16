@@ -1,3 +1,11 @@
+vermont (20190404-0vyatta3) unstable; urgency=medium
+
+  * Patch to add logging config to vermont.xml (Fixes: VRVDR-43699)
+  * Fix badly formatted line in debian changelog
+  * Fix lintian warnings about obsolete control usage
+
+ -- Nicholas Brown <nick.brown@att.com>  Thu, 16 Jan 2020 11:18:51 +0000
+
 vermont (20190404-0vyatta2) unstable; urgency=medium
 
   * DANOS Import
