@@ -8,6 +8,8 @@
 #ifndef MSG_H
 #define MSG_H
 
+#define __STDC_FORMAT_MACROS 1
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <syslog.h>
@@ -43,6 +45,7 @@ typedef void (*LOGFUNCTION)(void *);
 void msg_init(void);
 void msg_shutdown(void);
 void msg2(const int, const char*, const char*, const char*, const int, const char *, ...);
+int parse_log_level (const char *arg);
 void msg_setlevel(int);
 int msg_getlevel();
 void msg_setquiet(bool);
