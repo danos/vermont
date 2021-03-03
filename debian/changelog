@@ -1,3 +1,56 @@
+vermont (20210303-0vyatta1) unstable; urgency=medium
+
+  [ Nick Brown ]
+  * Use a wiki remote that exists
+
+  [ Lothar Braun ]
+  * Support openssl > 1.1.0 (older versions not supported)
+  * Travis: Switch build container from xenial to bionic
+
+  [ Nicholas Brown ]
+  * Better Boost detection in CMAKE
+
+  [ Lothar Braun ]
+  * Fix DTLS MTU calculation for OpenSSL 1.1.0
+
+  [ Philipp Urlbauer ]
+  * Fix logic bug found by clang10
+
+  [ Lothar Braun ]
+  * Reenable ConfigTester in vermonttest. Added test for parseProtoPattern
+  * Provide errors on invalid values for protocolIdentifier in aggregators
+  * Added mtutest to regularly run tests
+  * Introduce a new cmake option that allows graceful shutdown in case of options
+  * Throw exception on missing "id" field in configuration
+
+  [ Sebastian ]
+  * Added default values for some variables in the IpfixDbWriter
+
+  [ Lothar Braun ]
+  * Enable build of mysql and postgresql support in travis
+  * Compile fix for SQL module in debug mode
+  * Remove unused variables MAX_COL_COUNT to avoid clang-build errors
+  * libmysqlclient depends on libssl-dev, so disable mysql for DTLS=OFF
+  * TRWPortScanDetector: Provide better error messages on bad_alloc
+  * Bugfix: Wrong values for flowRate in ipfixSampler lead to crashes
+  * Bugfix: Error out on invalid subnet in HostStatistics
+
+  [ Nicholas Brown ]
+  * Add a logging attribute to the ipfix config element
+  * use out of source tree build for travis builds
+  * Don't hard code test_configs in test binary
+  * Add gcc-9 and gcc-10 to the travis builds
+  * Fix a stringop-truncation warning reported by gcc 10
+
+  [ Lothar Braun ]
+  * Bugfix: Initialize transoctected in IpfixPrinter
+
+  [ Nicholas Brown ]
+  * Rebase patches to new upstream
+  * Patch to allow tests to pass during package build
+
+ -- Nicholas Brown <nick.brown@att.com>  Wed, 03 Mar 2021 19:54:59 +0000
+
 vermont (20190404-0vyatta3) unstable; urgency=medium
 
   * Patch to add logging config to vermont.xml (Fixes: VRVDR-43699)
