@@ -29,7 +29,7 @@ index 4e85e39..ac0401d 100644
      ipfix/aggregator/AggregatorBaseCfg.cpp
      ipfix/aggregator/IpfixAggregatorCfg.cpp
 diff --git a/src/modules/ConfigManager.cpp b/src/modules/ConfigManager.cpp
-index 88b5c66..8d8d3df 100644
+index faa0ced..9b4b228 100644
 --- a/src/modules/ConfigManager.cpp
 +++ b/src/modules/ConfigManager.cpp
 @@ -43,6 +43,7 @@

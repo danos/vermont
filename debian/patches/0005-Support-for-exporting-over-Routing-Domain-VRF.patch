@@ -10,7 +10,7 @@ Subject: Support-for-exporting-over-Routing-Domain-VRF
  4 files changed, 65 insertions(+), 2 deletions(-)
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index d87ec02..9157317 100644
+index 2ef80ab..95792bf 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -176,6 +176,37 @@ IF (ENABLE_VRF)
@@ -52,7 +52,7 @@ index d87ec02..9157317 100644
  
  OPTION(SUPPORT_MONGO "Enable MongoDB support" OFF)
 diff --git a/src/common/ipfixlolib/ipfixlolib.c b/src/common/ipfixlolib/ipfixlolib.c
-index 5d019aa..049b4c7 100644
+index 05d3bfe..b4c7e0c 100644
 --- a/src/common/ipfixlolib/ipfixlolib.c
 +++ b/src/common/ipfixlolib/ipfixlolib.c
 @@ -53,6 +53,9 @@
@@ -110,10 +110,10 @@ index bf36c95..e530453 100644
  				if (vrfName.length() == 0)
  					THROWEXCEPTION("Invalid configuration parameter for vrfName"
 diff --git a/src/tests/ipfixlolib/CMakeLists.txt b/src/tests/ipfixlolib/CMakeLists.txt
-index d51bac7..e4b662e 100644
+index c9fb4d0..338ef6f 100644
 --- a/src/tests/ipfixlolib/CMakeLists.txt
 +++ b/src/tests/ipfixlolib/CMakeLists.txt
-@@ -55,4 +55,11 @@ IF (JOURNALD_FOUND)
+@@ -55,5 +55,12 @@ IF (JOURNALD_FOUND)
  	TARGET_LINK_LIBRARIES(example_code_2 ${JOURNALD_LIBRARIES})
  ENDIF (JOURNALD_FOUND)
  
@@ -125,3 +125,4 @@ index d51bac7..e4b662e 100644
 +ENDIF (VRF_MANAGER_FOUND)
 +
  ADD_TEST(example_2 example_code_2)
+ ADD_TEST(mtutest mtutest)

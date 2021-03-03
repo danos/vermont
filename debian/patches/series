@@ -8,4 +8,3 @@
 0008-RoutingPlane-Use-idiomatic-C-11.patch
 0009-Fix-parameter-order-to-match-order-in-declaration.patch
 0010-RoutingPlane-Don-t-log-in-the-data-path-by-default.patch
-0011-Add-a-logging-attribute-to-the-ipfix-config-element.patch
