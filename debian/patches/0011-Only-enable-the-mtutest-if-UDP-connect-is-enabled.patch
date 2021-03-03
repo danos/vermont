@@ -1,0 +1,22 @@
+From: Nicholas Brown <nick.brown@att.com>
+Date: Wed, 3 Mar 2021 19:47:02 +0000
+Subject: Only enable the mtutest if UDP connect is enabled
+
+Fixes #147
+---
+ src/tests/ipfixlolib/CMakeLists.txt | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/tests/ipfixlolib/CMakeLists.txt b/src/tests/ipfixlolib/CMakeLists.txt
+index 338ef6f..f1130ed 100644
+--- a/src/tests/ipfixlolib/CMakeLists.txt
++++ b/src/tests/ipfixlolib/CMakeLists.txt
+@@ -63,4 +63,6 @@ IF (VRF_MANAGER_FOUND)
+ ENDIF (VRF_MANAGER_FOUND)
+ 
+ ADD_TEST(example_2 example_code_2)
+-ADD_TEST(mtutest mtutest)
++IF (NOT DISABLE_UDP_CONNECT)
++	ADD_TEST(mtutest mtutest)
++ENDIF (NOT DISABLE_UDP_CONNECT)
+\ No newline at end of file
